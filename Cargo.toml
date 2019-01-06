@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 mio = "0.6"
+slab = "0.4"
