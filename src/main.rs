@@ -19,6 +19,7 @@ use std::net::{SocketAddr, IpAddr, Ipv4Addr, Shutdown};
 use std::io::{ErrorKind, Read, Write, stdout};
 use std::rc::Rc;
 use std::collections::VecDeque;
+use std::time::SystemTime;
 
 extern crate mio;
 use mio::{Token, Poll, PollOpt, Ready, Events};
@@ -30,6 +31,8 @@ use slab::Slab;
 const ECHO_PORT: u16 = 7; // read and write
 const DISCARD_PORT: u16 = 9; // only need to read
 const QOTD_PORT: u16 = 17; // only need to write
+const TIME32_PORT: u16 = 37; // only bother reading multiple times
+
 const QOTD: &[u8] = b"No quote today, the DB has gone away\n";
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -41,12 +44,14 @@ enum TcpStreamState {
     Echo{ unsent: VecDeque<u8> },
     Discard,
     Qotd{ sent: usize },
+    Time32, // assume it can be sent in one go, figure out response at send time
 }
 
 enum UdpState {
     Echo{ unsent: VecDeque<(SocketAddr,Box<[u8]>)> }, // completely unordered
     Discard,
     Qotd{ outstanding: VecDeque<SocketAddr> },
+    Time32{ outstanding: VecDeque<SocketAddr> },
 }
 
 enum ConnState {
@@ -114,6 +119,50 @@ fn listen_udp(poll: &Poll,  conns: &mut Slab<ConnState>, on: SocketAddr,
     entry.insert(ConnState::Udp { socket, state });
 }
 
+// returns false if a WouldBlock error was returned, and logs errors
+fn send_udp(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  prot: &str) -> bool {
+    match from.send_to(msg, to) {
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => return false,
+        Err(e) => eprintln!("Error sending {} UDP response to {}: {}", prot, to, e),
+        Ok(len) if len != msg.len() => {
+            eprintln!("Only sent {}/{} bytes of {} UDP response to {}",
+                len, msg.len(), prot, to
+            );
+        },
+        Ok(_) => {}
+    }
+    true
+}
+
+fn new_time32() -> [u8;4] {
+    let now = SystemTime::elapsed(&SystemTime::UNIX_EPOCH).unwrap_or_else(|ste| {
+        // Pre-1970 time? The system might have fallen into my own trap.
+        // In any case, this is just more fun to pass forward
+        ste.duration()
+    });
+    let now = now.as_secs();
+    // lsb: bit switches every ...
+    // 0: 1s
+    // 8: 256s ≈ 4min
+    // 11: ~64min ≈ 1hour
+    // 15: ~16hour ≈ 1day
+    let random_2 = ((now >> 16) ^ (now >> 8)) & 0b011;
+    // mess with the response, switch type every ~four minutes
+    let sometime = match random_2 {
+        0 => now & 0xff, // it's the 70's again
+        1 => 0x7fffff00 | (now & 0xff), // can you handle it
+        2 => now.wrapping_sub(60*60*24*365*100), // a blast from the past
+        3 => now ^ 0xff, // going backwards
+        _ => unreachable!()
+    };
+    [// as bytes in network order
+        (sometime >> 24) as u8 & 0xff,
+        (sometime >> 16) as u8 & 0xff,
+        (sometime >>  8) as u8 & 0xff,
+        sometime as u8
+    ]
+}
+
 fn main() {
     let mut read_buf = [0u8; 4096];
 
@@ -136,6 +185,11 @@ fn main() {
         TcpStreamState::Qotd{sent: 0},
         Ready::writable(),
     );
+    listen_tcp(&poll, &mut conns,
+        SocketAddr::new(ANY, TIME32_PORT),
+        TcpStreamState::Time32,
+        Ready::writable(),
+    ); // FIXME make this Oneshot (create a builder)
 
     listen_udp(&poll, &mut conns,
         SocketAddr::new(ANY, ECHO_PORT),
@@ -150,6 +204,11 @@ fn main() {
     listen_udp(&poll, &mut conns,
         SocketAddr::new(ANY, QOTD_PORT),
         UdpState::Qotd{outstanding: VecDeque::new()},
+        Ready::readable() | Ready::writable(),
+    );
+    listen_udp(&poll, &mut conns,
+        SocketAddr::new(ANY, TIME32_PORT),
+        UdpState::Time32{outstanding: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
 
@@ -270,6 +329,26 @@ fn main() {
                         }
                     }
                 }
+                ConnState::TcpStream{ stream, state: TcpStreamState::Time32 } => {
+                    let sometime = new_time32();
+                    match stream.write(&sometime) {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            eprintln!("Error sending qotd: {}, closing", e);
+                            end_stream(token, &mut conns, &poll);
+                        }
+                        Ok(len) => {
+                            if len > 0  &&  len != 4 {
+                                let remote = match stream.peer_addr() {
+                                    Ok(addr) => addr.to_string(),
+                                    Err(e) => format!("unknown IP (?: {})", e),
+                                };
+                                eprintln!("Only sent {} of 4 bytes to {} o_O", len, remote);
+                            }
+                            end_stream(token, &mut conns, &poll);
+                        }
+                    }
+                }
 
                 ConnState::Udp{ socket, state: UdpState::Echo{unsent} } => {
                     if event.readiness().is_readable() {
@@ -285,13 +364,11 @@ fn main() {
                         }
                     }
                     while let Some((addr,msg)) = unsent.front() {
-                        match socket.send_to(msg, addr) {
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Err(e) => eprintln!("Error echoing over UDP: {}", e),
-                            Ok(len) if len != msg.len() => eprintln!("Did not send whole echo msg to {}", addr),
-                            Ok(_) => {}
+                        if send_udp(socket, msg, addr, "echo") {
+                            let _ = unsent.pop_front();
+                        } else {
+                            break;
                         }
-                        let _ = unsent.pop_front();
                     }
                 }
                 ConnState::Udp{ socket, state: UdpState::Discard } => loop {
@@ -312,13 +389,30 @@ fn main() {
                         }
                     }
                     while let Some(addr) = outstanding.front() {
-                        match socket.send_to(QOTD, addr) {
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Err(e) => eprintln!("Error sending qotd over UDP: {}", e),
-                            Ok(len) if len != QOTD.len() => eprintln!("Did not send whole qotd to {}", addr),
-                            Ok(_) => {}
+                        if send_udp(socket, QOTD, addr, "qotd") {
+                            let _ = outstanding.pop_front();
+                        } else {
+                            break;
                         }
-                        let _ = outstanding.pop_front();
+                    }
+                }
+                ConnState::Udp{ socket, state: UdpState::Time32{outstanding} } => {
+                    if event.readiness().is_readable() {
+                        loop {
+                            match socket.recv_from(&mut read_buf) {
+                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                                Err(e) => eprintln!("Error receiving time (32bit) UDP packet: {}", e),
+                                Ok((_, from)) => outstanding.push_back(from),
+                            }
+                        }
+                    }
+                    let sometime = new_time32();
+                    while let Some(addr) = outstanding.front() {
+                        if send_udp(socket, &sometime, addr, "time32") {
+                            let _ = outstanding.pop_front();
+                        } else {
+                            break;
+                        }
                     }
                 }
             }
