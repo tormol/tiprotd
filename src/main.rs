@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 
 extern crate mio;
 use mio::{Token, Poll, PollOpt, Ready, Events};
-use mio::net::{TcpListener, TcpStream};
+use mio::net::{TcpListener, TcpStream, UdpSocket};
 
 extern crate slab;
 use slab::Slab;
@@ -43,13 +43,21 @@ enum TcpStreamState {
     Qotd{ sent: usize },
 }
 
+enum UdpState {
+    Discard,
+}
+
 enum ConnState {
-    Listener {
+    TcpListener {
         listener: Rc<TcpListener>,
         start_state: TcpStreamState,
         poll_streams_for: Ready,
     },
-    Stream {
+    Udp {
+        socket: UdpSocket,
+        state: UdpState,
+    },
+    TcpStream {
         stream: TcpStream,
         state: TcpStreamState,
     },
@@ -57,7 +65,7 @@ enum ConnState {
 
 fn end_stream(token: Token,  conns: &mut Slab<ConnState>,  poll: &Poll) {
     let stream = match conns.remove(token.0) {
-        ConnState::Stream{stream, state: _} => stream,
+        ConnState::TcpStream{stream, state: _} => stream,
         _ => unreachable!("Removed wrong type of token")
     };
     // TODO if length < 1/4 capacaity and above some minimum, recreate slab and reregister;
@@ -82,11 +90,26 @@ fn listen_tcp(poll: &Poll,  conns: &mut Slab<ConnState>, on: SocketAddr,
     let entry = conns.vacant_entry();
     poll.register(&listener, Token(entry.key()), Ready::readable(), PollOpt::edge())
         .expect("Cannot register listener");
-    entry.insert(ConnState::Listener {
+    entry.insert(ConnState::TcpListener {
         listener: Rc::new(listener),
         start_state,
         poll_streams_for,
     });
+}
+
+fn listen_udp(poll: &Poll,  conns: &mut Slab<ConnState>, on: SocketAddr,
+              state: UdpState,  poll_for: Ready,
+) {
+    let socket = UdpSocket::bind(&on).unwrap_or_else(|e| {
+        eprintln!("Cannot bind to {}: {}", on, e);
+        let fallback = SocketAddr::new(LOCALHOST, on.port()+NONRESERVED_PORT_OFFSET);
+        eprintln!("Trying {} instead", fallback);
+        UdpSocket::bind(&fallback).expect("Cannot bind to this port either. Aborting")
+    });
+    let entry = conns.vacant_entry();
+    poll.register(&socket, Token(entry.key()), poll_for, PollOpt::edge())
+        .expect("Cannot register listener");
+    entry.insert(ConnState::Udp { socket, state });
 }
 
 fn main() {
@@ -114,6 +137,12 @@ fn main() {
         Ready::writable(),
     );
 
+    listen_udp(&poll, &mut conns,
+        SocketAddr::new(ANY, DISCARD_PORT),
+        UdpState::Discard,
+        Ready::readable(),
+    );
+
     let mut events = Events::with_capacity(1024);
     loop {
         poll.poll(&mut events, None).expect("Cannot poll selector");
@@ -126,7 +155,7 @@ fn main() {
                 continue;
             }
             match &mut conns[token.0] {
-                &mut ConnState::Listener{ ref listener, ref start_state, poll_streams_for } => {
+                &mut ConnState::TcpListener{ ref listener, ref start_state, poll_streams_for } => {
                     // clone to end borrow of conns so that we can insert streams
                     let listener = listener.clone();
                     let start_state = start_state.clone();
@@ -144,7 +173,7 @@ fn main() {
                                 if let Err(e) = res {
                                     eprintln!("Cannot register TCP connection: {}", e);
                                 } else {
-                                    entry.insert(ConnState::Stream {
+                                    entry.insert(ConnState::TcpStream {
                                         stream,
                                         state: start_state.clone(),
                                     });
@@ -153,7 +182,8 @@ fn main() {
                         }
                     }
                 }
-                ConnState::Stream{ stream, state: TcpStreamState::Discard } => loop {
+
+                ConnState::TcpStream{ stream, state: TcpStreamState::Discard } => loop {
                     match stream.read(&mut read_buf) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
@@ -172,7 +202,7 @@ fn main() {
                         }
                     }
                 }
-                ConnState::Stream{ stream, state: TcpStreamState::Qotd{sent} } => loop {
+                ConnState::TcpStream{ stream, state: TcpStreamState::Qotd{sent} } => loop {
                     match stream.write(&QOTD[*sent..]) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
@@ -193,7 +223,7 @@ fn main() {
                         }
                     }
                 }
-                ConnState::Stream{ stream, state: TcpStreamState::Echo{unsent} } => {
+                ConnState::TcpStream{ stream, state: TcpStreamState::Echo{unsent} } => {
                     if event.readiness().is_readable() {
                         loop {
                             match stream.read(&mut read_buf) {
@@ -228,6 +258,14 @@ fn main() {
                             }
                             Ok(len) => unsent.drain(..len).for_each(|_| {} ),
                         }
+                    }
+                }
+
+                ConnState::Udp{ socket, state: UdpState::Discard } => loop {
+                    match socket.recv_from(&mut read_buf) {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => eprintln!("Error receiving UDP packet to discard: {}", e),
+                        Ok((len, from)) => eprintln!("Received {} bytes to discard from {}", len, from),
                     }
                 }
             }
