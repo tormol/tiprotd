@@ -44,6 +44,7 @@ enum TcpStreamState {
 }
 
 enum UdpState {
+    Echo{ unsent: VecDeque<(SocketAddr,Box<[u8]>)> }, // completely unordered
     Discard,
     Qotd{ outstanding: VecDeque<SocketAddr> },
 }
@@ -136,6 +137,11 @@ fn main() {
         Ready::writable(),
     );
 
+    listen_udp(&poll, &mut conns,
+        SocketAddr::new(ANY, ECHO_PORT),
+        UdpState::Echo{unsent: VecDeque::new()},
+        Ready::readable() | Ready::writable(),
+    );
     listen_udp(&poll, &mut conns,
         SocketAddr::new(ANY, DISCARD_PORT),
         UdpState::Discard,
@@ -265,6 +271,29 @@ fn main() {
                     }
                 }
 
+                ConnState::Udp{ socket, state: UdpState::Echo{unsent} } => {
+                    if event.readiness().is_readable() {
+                        loop {
+                            match socket.recv_from(&mut read_buf) {
+                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                                Err(e) => eprintln!("Error receiving UDP packet to echo: {}", e),
+                                Ok((len, from)) => {
+                                    let msg = Box::from(&read_buf[..len]);
+                                    unsent.push_back((from, msg))
+                                }
+                            }
+                        }
+                    }
+                    while let Some((addr,msg)) = unsent.front() {
+                        match socket.send_to(msg, addr) {
+                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                            Err(e) => eprintln!("Error echoing over UDP: {}", e),
+                            Ok(len) if len != msg.len() => eprintln!("Did not send whole echo msg to {}", addr),
+                            Ok(_) => {}
+                        }
+                        let _ = unsent.pop_front();
+                    }
+                }
                 ConnState::Udp{ socket, state: UdpState::Discard } => loop {
                     match socket.recv_from(&mut read_buf) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
