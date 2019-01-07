@@ -18,6 +18,7 @@
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Shutdown};
 use std::io::{ErrorKind, Read, Write, stdout};
 use std::rc::Rc;
+use std::collections::VecDeque;
 
 extern crate mio;
 use mio::{Token, Poll, PollOpt, Ready, Events};
@@ -26,6 +27,7 @@ use mio::net::{TcpListener, TcpStream};
 extern crate slab;
 use slab::Slab;
 
+const ECHO_PORT: u16 = 7; // read and write
 const DISCARD_PORT: u16 = 9; // only need to read
 const QOTD_PORT: u16 = 17; // only need to write
 const QOTD: &[u8] = b"No quote today, the DB has gone away\n";
@@ -36,6 +38,7 @@ const NONRESERVED_PORT_OFFSET: u16 = 10_000;
 
 #[derive(Clone)]
 enum TcpStreamState {
+    Echo{ unsent: VecDeque<u8> },
     Discard,
     Qotd{ sent: usize },
 }
@@ -87,16 +90,23 @@ fn listen_tcp(poll: &Poll,  conns: &mut Slab<ConnState>, on: SocketAddr,
 }
 
 fn main() {
+    let mut read_buf = [0u8; 4096];
+
     // Create a poll instance
     let poll = Poll::new().expect("Cannot create selector");
     let mut conns = Slab::with_capacity(512);
+
+    listen_tcp(&poll, &mut conns,
+        SocketAddr::new(ANY, ECHO_PORT),
+        TcpStreamState::Echo{unsent: VecDeque::new()},
+        Ready::readable() | Ready::writable(),
+    );
 
     listen_tcp(&poll, &mut conns,
         SocketAddr::new(LOCALHOST, DISCARD_PORT),
         TcpStreamState::Discard,
         Ready::readable(),
     );
-    let mut discard_buf = vec![0u8; 4096].into_boxed_slice();
 
     listen_tcp(&poll, &mut conns,
         SocketAddr::new(ANY, QOTD_PORT),
@@ -144,7 +154,7 @@ fn main() {
                     }
                 }
                 ConnState::Stream{ stream, state: TcpStreamState::Discard } => loop {
-                    match stream.read(&mut discard_buf) {
+                    match stream.read(&mut read_buf) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
                             eprintln!("Error reading data to discard: {}, closing", e);
@@ -158,7 +168,7 @@ fn main() {
                         }
                         Ok(len) => {
                             println!("len: {}", len);
-                            stdout().write(&discard_buf[..len]).expect("Writing to stdout failed");
+                            stdout().write(&read_buf[..len]).expect("Writing to stdout failed");
                         }
                     }
                 }
@@ -180,6 +190,43 @@ fn main() {
                                 end_stream(token, &mut conns, &poll);
                                 break;
                             }
+                        }
+                    }
+                }
+                ConnState::Stream{ stream, state: TcpStreamState::Echo{unsent} } => {
+                    if event.readiness().is_readable() {
+                        loop {
+                            match stream.read(&mut read_buf) {
+                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                                Err(e) => {
+                                    eprintln!("Error reading data to echo: {}, hope the write errors too", e);
+                                    break;
+                                }
+                                Ok(0) => break,
+                                Ok(len) => {
+                                    // TODO add max size, but must be done per IP
+                                    unsent.extend(&read_buf[..len]);
+                                }
+                            }
+                        }
+                    }
+                    // if the socket is write ready but we don't have anything to write,
+                    // we cannot drain the readiness, so always try to write when we get some
+                    // if there is data to write, we need to try writing it even if no more
+                    // data is received
+                    while !unsent.is_empty() {
+                        match stream.write(unsent.as_slices().0) {
+                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                            Err(e) => {
+                                eprintln!("Error sending echo: {}, closing", e);
+                                end_stream(token, &mut conns, &poll);
+                                break;
+                            }
+                            Ok(0) => {
+                                end_stream(token, &mut conns, &poll);
+                                break;
+                            }
+                            Ok(len) => unsent.drain(..len).for_each(|_| {} ),
                         }
                     }
                 }
