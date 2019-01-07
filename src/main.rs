@@ -45,6 +45,7 @@ enum TcpStreamState {
 
 enum UdpState {
     Discard,
+    Qotd{ outstanding: VecDeque<SocketAddr> },
 }
 
 enum ConnState {
@@ -124,13 +125,11 @@ fn main() {
         TcpStreamState::Echo{unsent: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
-
     listen_tcp(&poll, &mut conns,
         SocketAddr::new(LOCALHOST, DISCARD_PORT),
         TcpStreamState::Discard,
         Ready::readable(),
     );
-
     listen_tcp(&poll, &mut conns,
         SocketAddr::new(ANY, QOTD_PORT),
         TcpStreamState::Qotd{sent: 0},
@@ -141,6 +140,11 @@ fn main() {
         SocketAddr::new(ANY, DISCARD_PORT),
         UdpState::Discard,
         Ready::readable(),
+    );
+    listen_udp(&poll, &mut conns,
+        SocketAddr::new(ANY, QOTD_PORT),
+        UdpState::Qotd{outstanding: VecDeque::new()},
+        Ready::readable() | Ready::writable(),
     );
 
     let mut events = Events::with_capacity(1024);
@@ -266,6 +270,26 @@ fn main() {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => eprintln!("Error receiving UDP packet to discard: {}", e),
                         Ok((len, from)) => eprintln!("Received {} bytes to discard from {}", len, from),
+                    }
+                }
+                ConnState::Udp{ socket, state: UdpState::Qotd{outstanding} } => {
+                    if event.readiness().is_readable() {
+                        loop {
+                            match socket.recv_from(&mut read_buf) {
+                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                                Err(e) => eprintln!("Error receiving qotd UDP packet: {}", e),
+                                Ok((_, from)) => outstanding.push_back(from),
+                            }
+                        }
+                    }
+                    while let Some(addr) = outstanding.front() {
+                        match socket.send_to(QOTD, addr) {
+                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                            Err(e) => eprintln!("Error sending qotd over UDP: {}", e),
+                            Ok(len) if len != QOTD.len() => eprintln!("Did not send whole qotd to {}", addr),
+                            Ok(_) => {}
+                        }
+                        let _ = outstanding.pop_front();
                     }
                 }
             }
