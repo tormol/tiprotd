@@ -57,7 +57,7 @@ enum TcpStreamState {
 }
 
 enum UdpState {
-    Echo{ unsent: VecDeque<(SocketAddr,Box<[u8]>)> }, // completely unordered
+    Echo{ unsent: VecDeque<(SocketAddr,Rc<[u8]>)> }, // completely unordered
     Discard,
     Qotd{ outstanding: VecDeque<SocketAddr> },
     Time32{ outstanding: VecDeque<SocketAddr> },
@@ -316,6 +316,7 @@ fn main() {
                                 Ok(len) => {
                                     // TODO add max size, but must be done per IP
                                     unsent.extend(&read_buf[..len]);
+                                    unsent.extend(&read_buf[..len]);
                                 }
                             }
                         }
@@ -368,9 +369,10 @@ fn main() {
                                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(e) => eprintln!("Error receiving UDP packet to echo: {}", e),
                                 Ok((len, from)) => {
-                                    if limits.allow_unacknowledged_send(from, len) {
-                                        let msg = Box::from(&read_buf[..len]);
-                                        unsent.push_back((from, msg))
+                                    if limits.allow_unacknowledged_send(from, 2*len) {
+                                        let msg = Rc::<[u8]>::from(&read_buf[..len]);
+                                        unsent.push_back((from, msg.clone()));
+                                        unsent.push_back((from, msg));
                                     }
                                 }
                             }
