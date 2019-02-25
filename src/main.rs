@@ -16,13 +16,13 @@
  */
 
 mod assigned_addr;
-use assigned_addr::AssignedAddr;
+mod client_limiter;
 
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Shutdown};
 use std::io::{ErrorKind, Read, Write, stdout};
 use std::rc::Rc;
-use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime};
+use std::collections::VecDeque;
+use std::time::{Duration, SystemTime};
 
 extern crate mio;
 use mio::{Token, Poll, PollOpt, Ready, Events};
@@ -44,14 +44,9 @@ const NONRESERVED_PORT_OFFSET: u16 = 10_000;
 
 /// Maximum duration for which stats that count toward various DoS-preventing
 /// limits are remembered.
-const LIMIT_WINDOW: Duration = Duration::from_secs(10*60);
-/// Hom many UDP bytes + packets can be sent to a client per `LIMIT_WINDOW`
+const LIMITS_DURATION: Duration = Duration::from_secs(10*60);
+/// Hom many UDP bytes + packets can be sent to a client per `LIMITS_DURATION`
 const UDP_SEND_LIMIT: u32 = 1*1024*1024;
-/// Is added to the size of each sent packet to ensure that empty packets are
-/// counted. This should at minimum be the header size for ethernet + IPv6 + UDP,
-/// but can be greater to try to account for the resources required to handle
-/// the packet.
-const UDP_PACKET_COST: u32 = 200; // guesstimate
 
 #[derive(Clone)]
 enum TcpStreamState {
@@ -148,73 +143,6 @@ fn send_udp(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  prot: &str) -> boo
     true
 }
 
-/// Imposes limits on clients to prevent various forms of denial-of-service.
-/// 
-/// What is considered a client is more coarse-grained than a `SocketAddr`,
-/// as an attacker can create multiple of those. See [`AssignedAddr`](struct.AssignedAddr.html)
-/// for details.
-/// 
-/// # Memory span
-/// 
-/// At some point, old traffic must be forgotten. This includes old "bans", or
-/// we would need an unreasonable amount of space and also permaban unrelated
-/// clients within the same address range.
-///
-/// For simplicity, all clients use the same timeout
-///
-/// # Limits
-///
-/// * The amount of sent UDP traffic to prevent DDoS amplification or
-///   indirection. This is the most important limit as it affects other
-///   computers.
-/// * TODO unsent TCP data
-/// * TODO TCP connections
-#[derive(Debug)]
-pub struct AddrLimits {
-    window_end: Instant,
-    // use secure default hasher because an attacker might have a bigger subnet
-    unacknowledged_sent: HashMap<AssignedAddr,u32>,
-}
-impl AddrLimits {
-    pub fn new() -> Self {
-        AddrLimits {
-            window_end: Instant::now(),
-            unacknowledged_sent: HashMap::new(),
-        }
-    }
-    pub fn allow_unacknowledged_send(&mut self,  addr: SocketAddr,  to_send: usize) -> bool {
-        let assigned = AssignedAddr::from(addr);
-        // multicast might require different limits, so block it unconditionally.
-        if assigned.is_multicast() {
-            return false;
-        }
-        // clear old entries
-        let now = Instant::now();
-        if now > self.window_end {
-            // reallocate to not leak
-            self.unacknowledged_sent = HashMap::new();
-            self.window_end = now + LIMIT_WINDOW;
-        }
-        // store smaller type, but perform calculation on usize just in case we
-        // ever receive multi-gigabyte packets
-        let packet_cost = to_send + UDP_PACKET_COST as usize;
-        let count = self.unacknowledged_sent.entry(assigned).or_insert(0);
-        if *count as usize + packet_cost <= UDP_SEND_LIMIT as usize {
-            *count += packet_cost as u32;
-            true
-        } else if *count == UDP_SEND_LIMIT {
-            // limit previously reached - don't log
-            false
-        } else {
-            // limit reached - don't send packet. Also don't send future
-            // smaller packets, as that could be surprising
-            *count = UDP_SEND_LIMIT;
-            eprintln!("LIMIT EXCEEDED: unacknowledged (UDP) send to {}", assigned);
-            false
-        }
-    }
-}
-
 fn new_time32() -> [u8;4] {
     let now = SystemTime::elapsed(&SystemTime::UNIX_EPOCH).unwrap_or_else(|ste| {
         // Pre-1970 time? The system might have fallen into my own trap.
@@ -293,7 +221,7 @@ fn main() {
         Ready::readable() | Ready::writable(),
     );
 
-    let mut limits = AddrLimits::new();
+    let mut limits = client_limiter::ClientLimiter::new(LIMITS_DURATION, UDP_SEND_LIMIT);
 
     let mut events = Events::with_capacity(1024);
     loop {
