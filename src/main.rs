@@ -344,9 +344,9 @@ fn main() {
                 ConnState::TcpStream{ stream, state: TcpStreamState::Time32 } => {
                     let sometime = new_time32();
                     match stream.write(&sometime) {
-                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
                         Err(e) => {
-                            eprintln!("Error sending qotd: {}, closing", e);
+                            eprintln!("Error sending time32: {}, closing", e);
                             end_stream(token, &mut conns, &poll);
                         }
                         Ok(len) => {
