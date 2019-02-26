@@ -17,6 +17,7 @@
 
 mod assigned_addr;
 mod client_limiter;
+use client_limiter::ClientLimiter;
 
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Shutdown};
 use std::io::{ErrorKind, Read, Write, stdout};
@@ -47,6 +48,12 @@ const NONRESERVED_PORT_OFFSET: u16 = 10_000;
 const LIMITS_DURATION: Duration = Duration::from_secs(10*60);
 /// Hom many UDP bytes + packets can be sent to a client per `LIMITS_DURATION`
 const UDP_SEND_LIMIT: u32 = 1*1024*1024;
+/// How many resources a client is allowwed to consume at any point
+const RESOURCE_LIMIT: u32 = 500*1024;
+/// How many bytes an open connection should count as.
+/// This should include buffers and structs used by the OS as well as structs
+/// and fixed tiny buffers used by this program.
+const CONNECTION_COST: usize = 2000; // guess
 
 #[derive(Clone)]
 enum TcpStreamState {
@@ -75,15 +82,20 @@ enum ConnState {
     },
     TcpStream {
         stream: TcpStream,
+        /// peer / remote / client address.
+        /// Need this for ClientLimiter because stream.peer_addr() can fail
+        /// after IO errors.
+        addr: SocketAddr,
         state: TcpStreamState,
     },
 }
 
-fn end_stream(token: Token,  conns: &mut Slab<ConnState>,  poll: &Poll) {
-    let stream = match conns.remove(token.0) {
-        ConnState::TcpStream{stream, state: _} => stream,
-        _ => unreachable!("Removed wrong type of token")
+fn end_stream(token: Token,  limits: &mut ClientLimiter,  conns: &mut Slab<ConnState>,  poll: &Poll) {
+    let (stream, addr) = match conns.remove(token.0) {
+        ConnState::TcpStream{stream, addr, ..} => (stream, addr),
+        _ => panic!("Removed wrong type of token")
     };
+    limits.release_resources(addr, CONNECTION_COST);
     // TODO if length < 1/4 capacaity and above some minimum, recreate slab and reregister;
     // shrink_to_fit() doesn't do much: https://github.com/carllerche/slab/issues/38
     if let Err(e) = stream.shutdown(Shutdown::Both) {
@@ -221,7 +233,7 @@ fn main() {
         Ready::readable() | Ready::writable(),
     );
 
-    let mut limits = client_limiter::ClientLimiter::new(LIMITS_DURATION, UDP_SEND_LIMIT);
+    let mut limits = ClientLimiter::new(LIMITS_DURATION, UDP_SEND_LIMIT, RESOURCE_LIMIT);
 
     let mut events = Events::with_capacity(1024);
     loop {
@@ -243,7 +255,15 @@ fn main() {
                         match listener.accept() {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                             Err(e) => eprintln!("Error accepting TCP connection: {}", e),
-                            Ok((stream, _addr)) => {
+                            Ok((stream, addr)) => {
+                                if !limits.request_resources(addr, CONNECTION_COST) {
+                                    // once the connection is ready to accept(),
+                                    // the work to establish the connection has
+                                    // already been performed by the OS. The
+                                    // best we can do is to immediately close
+                                    // it, to not let it consume more resources.
+                                    continue;
+                                }
                                 let entry = conns.vacant_entry();
                                 let res = poll.register(&stream,
                                     Token(entry.key()),
@@ -255,6 +275,7 @@ fn main() {
                                 } else {
                                     entry.insert(ConnState::TcpStream {
                                         stream,
+                                        addr,
                                         state: start_state.clone(),
                                     });
                                 }
@@ -263,17 +284,17 @@ fn main() {
                     }
                 }
 
-                ConnState::TcpStream{ stream, state: TcpStreamState::Discard } => loop {
+                ConnState::TcpStream{ stream, state: TcpStreamState::Discard, .. } => loop {
                     match stream.read(&mut read_buf) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
                             eprintln!("Error reading data to discard: {}, closing", e);
-                            end_stream(token, &mut conns, &poll);
+                            end_stream(token, &mut limits, &mut conns, &poll);
                             break;
                         }
                         Ok(0) => {
                             eprintln!("ending {:?}", stream);
-                            end_stream(token, &mut conns, &poll);
+                            end_stream(token, &mut limits, &mut conns, &poll);
                             break;
                         }
                         Ok(len) => {
@@ -282,41 +303,43 @@ fn main() {
                         }
                     }
                 }
-                ConnState::TcpStream{ stream, state: TcpStreamState::Qotd{sent} } => loop {
+                ConnState::TcpStream{ stream, state: TcpStreamState::Qotd{sent}, .. } => loop {
                     match stream.write(&QOTD[*sent..]) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
                             eprintln!("Error sending qotd: {}, closing", e);
-                            end_stream(token, &mut conns, &poll);
+                            end_stream(token, &mut limits, &mut conns, &poll);
                             break;
                         }
                         Ok(0) => {
-                            end_stream(token, &mut conns, &poll);
+                            end_stream(token, &mut limits, &mut conns, &poll);
                             break;
                         }
                         Ok(len) => {
                             *sent += len;
                             if *sent >= QOTD.len() {
-                                end_stream(token, &mut conns, &poll);
+                                end_stream(token, &mut limits, &mut conns, &poll);
                                 break;
                             }
                         }
                     }
                 }
-                ConnState::TcpStream{ stream, state: TcpStreamState::Echo{unsent} } => {
+                ConnState::TcpStream{ stream, addr, state: TcpStreamState::Echo{unsent} } => {
                     if event.readiness().is_readable() {
                         loop {
                             match stream.read(&mut read_buf) {
                                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(e) => {
-                                    eprintln!("Error reading data to echo: {}, hope the write errors too", e);
+                                    eprintln!("Error reading data to echo from {}: {}", addr, e);
+                                    eprintln!("\tHope the write errors too");
                                     break;
                                 }
                                 Ok(0) => break,
                                 Ok(len) => {
-                                    // TODO add max size, but must be done per IP
-                                    unsent.extend(&read_buf[..len]);
-                                    unsent.extend(&read_buf[..len]);
+                                    if limits.request_resources(*addr, 2*len) {
+                                        unsent.extend(&read_buf[..len]);
+                                        unsent.extend(&read_buf[..len]);
+                                    }
                                 }
                             }
                         }
@@ -330,38 +353,43 @@ fn main() {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                             Err(e) => {
                                 eprintln!("Error sending echo: {}, closing", e);
-                                end_stream(token, &mut conns, &poll);
+                                limits.release_resources(*addr, unsent.len());
+                                end_stream(token, &mut limits, &mut conns, &poll);
                                 break;
                             }
                             Ok(0) => {
-                                end_stream(token, &mut conns, &poll);
+                                limits.release_resources(*addr, unsent.len());
+                                end_stream(token, &mut limits, &mut conns, &poll);
                                 break;
                             }
-                            Ok(len) => unsent.drain(..len).for_each(|_| {} ),
+                            Ok(len) => {
+                                limits.release_resources(*addr, len);
+                                unsent.drain(..len).for_each(|_| {} );
+                            }
                         }
                     }
                 }
-                ConnState::TcpStream{ stream, state: TcpStreamState::Time32 } => {
+                ConnState::TcpStream{ stream, addr, state: TcpStreamState::Time32 } => {
                     let sometime = new_time32();
                     match stream.write(&sometime) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
                         Err(e) => {
-                            eprintln!("Error sending time32: {}, closing", e);
-                            end_stream(token, &mut conns, &poll);
+                            eprintln!("Error sending time32 to {}: {}, closing", addr, e);
+                            end_stream(token, &mut limits, &mut conns, &poll);
                         }
                         Ok(len) => {
                             if len > 0  &&  len != 4 {
-                                let remote = match stream.peer_addr() {
-                                    Ok(addr) => addr.to_string(),
-                                    Err(e) => format!("unknown IP (?: {})", e),
-                                };
-                                eprintln!("Only sent {} of 4 bytes to {} o_O", len, remote);
+                                eprintln!("Only sent {} of 4 bytes to {} o_O", len, addr);
                             }
-                            end_stream(token, &mut conns, &poll);
+                            end_stream(token, &mut limits, &mut conns, &poll);
                         }
                     }
                 }
 
+                // don't count UDP data toward resource limits, as sending
+                // is only limited by the OS's socket buffer, and not by the
+                // client or network. A client should not be able to cause an
+                // issue here before hitting its UDP send limit.
                 ConnState::Udp{ socket, state: UdpState::Echo{unsent} } => {
                     if event.readiness().is_readable() {
                         loop {
