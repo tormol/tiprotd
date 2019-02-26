@@ -19,7 +19,7 @@ mod assigned_addr;
 mod client_limiter;
 use client_limiter::ClientLimiter;
 
-use std::net::{SocketAddr, IpAddr, Ipv4Addr, Shutdown};
+use std::net::{SocketAddr, IpAddr, Ipv6Addr, Shutdown};
 use std::io::{ErrorKind, Read, Write, stdout};
 use std::rc::Rc;
 use std::collections::VecDeque;
@@ -39,8 +39,8 @@ const TIME32_PORT: u16 = 37; // only bother reading multiple times
 
 const QOTD: &[u8] = b"No quote today, the DB has gone away\n";
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-const ANY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+const LOCALHOST: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+const ANY: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 const NONRESERVED_PORT_OFFSET: u16 = 10_000;
 
 /// Maximum duration for which stats that count toward various DoS-preventing
