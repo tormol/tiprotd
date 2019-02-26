@@ -20,7 +20,7 @@ mod client_limiter;
 use client_limiter::ClientLimiter;
 
 use std::net::{SocketAddr, IpAddr, Ipv6Addr, Shutdown};
-use std::io::{ErrorKind, Read, Write, stdout};
+use std::io::{self, ErrorKind, Read, Write, stdout};
 use std::rc::Rc;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
@@ -104,12 +104,17 @@ impl Server {
         }
     }
 
-    fn end_stream(&mut self,  token: Token) {
+    fn end_stream(&mut self,  token: Token,  and_release: usize,
+            cause: io::Result<usize>,  err_op: &str,
+    ) {
         let (stream, addr) = match self.conns.remove(token.0) {
             ConnState::TcpStream{stream, addr, ..} => (stream, addr),
             _ => panic!("Removed wrong type of token")
         };
-        self.limits.release_resources(addr, CONNECTION_COST);
+        if let Err(e) = cause {
+            eprintln!("Error {} {}: {}, closing", err_op, addr, e);
+        }
+        self.limits.release_resources(addr, CONNECTION_COST+and_release);
         // TODO if length < 1/4 capacaity and above some minimum, recreate slab and reregister;
         // shrink_to_fit() doesn't do much: https://github.com/carllerche/slab/issues/38
         if let Err(e) = stream.shutdown(Shutdown::Both) {
@@ -294,43 +299,29 @@ fn main() {
                     }
                 }
 
-                ConnState::TcpStream{ stream, state: TcpStreamState::Discard, .. } => loop {
+                &mut ConnState::TcpStream{ ref mut stream, addr, state: TcpStreamState::Discard } => loop {
                     match stream.read(&mut read_buf) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(e) => {
-                            eprintln!("Error reading data to discard: {}, closing", e);
-                            server.end_stream(token);
-                            break;
-                        }
-                        Ok(0) => {
-                            eprintln!("ending {:?}", stream);
-                            server.end_stream(token);
-                            break;
-                        }
-                        Ok(len) => {
+                        Ok(len) if len > 0 => {
                             println!("len: {}", len);
                             stdout().write(&read_buf[..len]).expect("Writing to stdout failed");
+                        }
+                        end => {
+                            server.end_stream(token, 0, end, "reading to discard from");
+                            println!("ending {}", addr);
+                            break;
                         }
                     }
                 }
                 ConnState::TcpStream{ stream, state: TcpStreamState::Qotd{sent}, .. } => loop {
                     match stream.write(&QOTD[*sent..]) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Err(e) => {
-                            eprintln!("Error sending qotd: {}, closing", e);
-                            server.end_stream(token);
-                            break;
-                        }
-                        Ok(0) => {
-                            server.end_stream(token);
-                            break;
-                        }
-                        Ok(len) => {
+                        Ok(len) if len > 0 && *sent+len < QOTD.len() => {
                             *sent += len;
-                            if *sent >= QOTD.len() {
-                                server.end_stream(token);
-                                break;
-                            }
+                        }
+                        closing => {
+                            server.end_stream(token, 0, closing, "sending qotd to");
+                            break;
                         }
                     }
                 }
@@ -361,20 +352,14 @@ fn main() {
                     while !unsent.is_empty() {
                         match stream.write(unsent.as_slices().0) {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Err(e) => {
-                                eprintln!("Error sending echo: {}, closing", e);
-                                server.limits.release_resources(*addr, unsent.len());
-                                server.end_stream(token);
-                                break;
-                            }
-                            Ok(0) => {
-                                server.limits.release_resources(*addr, unsent.len());
-                                server.end_stream(token);
-                                break;
-                            }
-                            Ok(len) => {
+                            Ok(len @ 1..=std::usize::MAX) => {
                                 server.limits.release_resources(*addr, len);
                                 unsent.drain(..len).for_each(|_| {} );
+                            }
+                            end => {
+                                let discard = unsent.len(); // make borrowck happy
+                                server.end_stream(token, discard, end, "sending echo to");
+                                break;
                             }
                         }
                     }
@@ -383,15 +368,11 @@ fn main() {
                     let sometime = new_time32();
                     match stream.write(&sometime) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
-                        Err(e) => {
-                            eprintln!("Error sending time32 to {}: {}, closing", addr, e);
-                            server.end_stream(token);
-                        }
-                        Ok(len) => {
-                            if len > 0  &&  len != 4 {
+                        progress => {
+                            if let Ok(len @ 1..=3) = progress {
                                 eprintln!("Only sent {} of 4 bytes to {} o_O", len, addr);
                             }
-                            server.end_stream(token);
+                            server.end_stream(token, 0, progress, "sending time32 to");
                         }
                     }
                 }
