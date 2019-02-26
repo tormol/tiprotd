@@ -90,54 +90,69 @@ enum ConnState {
     },
 }
 
-fn end_stream(token: Token,  limits: &mut ClientLimiter,  conns: &mut Slab<ConnState>,  poll: &Poll) {
-    let (stream, addr) = match conns.remove(token.0) {
-        ConnState::TcpStream{stream, addr, ..} => (stream, addr),
-        _ => panic!("Removed wrong type of token")
-    };
-    limits.release_resources(addr, CONNECTION_COST);
-    // TODO if length < 1/4 capacaity and above some minimum, recreate slab and reregister;
-    // shrink_to_fit() doesn't do much: https://github.com/carllerche/slab/issues/38
-    if let Err(e) = stream.shutdown(Shutdown::Both) {
-        eprintln!("Error shutting down {:?}: {}", stream, e);
-    }
-    if let Err(e) = poll.deregister(&stream) {
-        eprintln!("Error deregistering {:?}: {}", stream, e);
-    }
+struct Server {
+    poll: Poll,
+    conns: Slab<ConnState>,
+    limits: ClientLimiter,
 }
+impl Server {
+    fn new() -> Self {
+        Server {
+            poll: Poll::new().expect("Cannot create selector"),
+            conns: Slab::with_capacity(512),
+            limits: ClientLimiter::new(LIMITS_DURATION, UDP_SEND_LIMIT, RESOURCE_LIMIT),
+        }
+    }
 
-fn listen_tcp(poll: &Poll,  conns: &mut Slab<ConnState>, on: SocketAddr,
-              start_state: TcpStreamState,  poll_streams_for: Ready,
-) {
-    let listener = TcpListener::bind(&on).unwrap_or_else(|e| {
-        eprintln!("Cannot listen to {}: {}", on, e);
-        let fallback = SocketAddr::new(LOCALHOST, on.port()+NONRESERVED_PORT_OFFSET);
-        eprintln!("Trying {} instead", fallback);
-        TcpListener::bind(&fallback).expect("Cannot listen to this port either. Aborting")
-    });
-    let entry = conns.vacant_entry();
-    poll.register(&listener, Token(entry.key()), Ready::readable(), PollOpt::edge())
-        .expect("Cannot register listener");
-    entry.insert(ConnState::TcpListener {
-        listener: Rc::new(listener),
-        start_state,
-        poll_streams_for,
-    });
-}
+    fn end_stream(&mut self,  token: Token) {
+        let (stream, addr) = match self.conns.remove(token.0) {
+            ConnState::TcpStream{stream, addr, ..} => (stream, addr),
+            _ => panic!("Removed wrong type of token")
+        };
+        self.limits.release_resources(addr, CONNECTION_COST);
+        // TODO if length < 1/4 capacaity and above some minimum, recreate slab and reregister;
+        // shrink_to_fit() doesn't do much: https://github.com/carllerche/slab/issues/38
+        if let Err(e) = stream.shutdown(Shutdown::Both) {
+            eprintln!("Error shutting down {:?}: {}", stream, e);
+        }
+        if let Err(e) = self.poll.deregister(&stream) {
+            eprintln!("Error deregistering {:?}: {}", stream, e);
+        }
+    }
 
-fn listen_udp(poll: &Poll,  conns: &mut Slab<ConnState>, on: SocketAddr,
-              state: UdpState,  poll_for: Ready,
-) {
-    let socket = UdpSocket::bind(&on).unwrap_or_else(|e| {
-        eprintln!("Cannot bind to {}: {}", on, e);
-        let fallback = SocketAddr::new(LOCALHOST, on.port()+NONRESERVED_PORT_OFFSET);
-        eprintln!("Trying {} instead", fallback);
-        UdpSocket::bind(&fallback).expect("Cannot bind to this port either. Aborting")
-    });
-    let entry = conns.vacant_entry();
-    poll.register(&socket, Token(entry.key()), poll_for, PollOpt::edge())
-        .expect("Cannot register listener");
-    entry.insert(ConnState::Udp { socket, state });
+
+    fn listen_tcp(&mut self,  on: SocketAddr,
+        start_state: TcpStreamState,  poll_streams_for: Ready,
+    ) {
+        let listener = TcpListener::bind(&on).unwrap_or_else(|e| {
+            eprintln!("Cannot listen to {}: {}", on, e);
+            let fallback = SocketAddr::new(LOCALHOST, on.port()+NONRESERVED_PORT_OFFSET);
+            eprintln!("Trying {} instead", fallback);
+            TcpListener::bind(&fallback).expect("Cannot listen to this port either. Aborting")
+        });
+        let entry = self.conns.vacant_entry();
+        self.poll.register(&listener, Token(entry.key()), Ready::readable(), PollOpt::edge())
+            .expect("Cannot register listener");
+        entry.insert(ConnState::TcpListener {
+            listener: Rc::new(listener),
+            start_state,
+            poll_streams_for,
+        });
+    }
+
+
+    fn listen_udp(&mut self,  on: SocketAddr,  state: UdpState,  poll_for: Ready) {
+        let socket = UdpSocket::bind(&on).unwrap_or_else(|e| {
+            eprintln!("Cannot bind to {}: {}", on, e);
+            let fallback = SocketAddr::new(LOCALHOST, on.port()+NONRESERVED_PORT_OFFSET);
+            eprintln!("Trying {} instead", fallback);
+            UdpSocket::bind(&fallback).expect("Cannot bind to this port either. Aborting")
+        });
+        let entry = self.conns.vacant_entry();
+        self.poll.register(&socket, Token(entry.key()), poll_for, PollOpt::edge())
+            .expect("Cannot register listener");
+        entry.insert(ConnState::Udp { socket, state });
+    }
 }
 
 // returns false if a WouldBlock error was returned, and logs errors
@@ -185,68 +200,63 @@ fn new_time32() -> [u8;4] {
 }
 
 fn main() {
-    let mut read_buf = [0u8; 4096];
+    let mut server = Server::new();
 
-    // Create a poll instance
-    let poll = Poll::new().expect("Cannot create selector");
-    let mut conns = Slab::with_capacity(512);
-
-    listen_tcp(&poll, &mut conns,
+    server.listen_tcp(
         SocketAddr::new(ANY, ECHO_PORT),
         TcpStreamState::Echo{unsent: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
-    listen_tcp(&poll, &mut conns,
+    server.listen_tcp(
         SocketAddr::new(LOCALHOST, DISCARD_PORT),
         TcpStreamState::Discard,
         Ready::readable(),
     );
-    listen_tcp(&poll, &mut conns,
+    server.listen_tcp(
         SocketAddr::new(ANY, QOTD_PORT),
         TcpStreamState::Qotd{sent: 0},
         Ready::writable(),
     );
-    listen_tcp(&poll, &mut conns,
+    server.listen_tcp(
         SocketAddr::new(ANY, TIME32_PORT),
         TcpStreamState::Time32,
         Ready::writable(),
     ); // FIXME make this Oneshot (create a builder)
 
-    listen_udp(&poll, &mut conns,
+    server.listen_udp(
         SocketAddr::new(ANY, ECHO_PORT),
         UdpState::Echo{unsent: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
-    listen_udp(&poll, &mut conns,
+    server.listen_udp(
         SocketAddr::new(ANY, DISCARD_PORT),
         UdpState::Discard,
         Ready::readable(),
     );
-    listen_udp(&poll, &mut conns,
+    server.listen_udp(
         SocketAddr::new(ANY, QOTD_PORT),
         UdpState::Qotd{outstanding: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
-    listen_udp(&poll, &mut conns,
+    server.listen_udp(
         SocketAddr::new(ANY, TIME32_PORT),
         UdpState::Time32{outstanding: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
 
-    let mut limits = ClientLimiter::new(LIMITS_DURATION, UDP_SEND_LIMIT, RESOURCE_LIMIT);
-
+    let mut read_buf = [0u8; 4096];
     let mut events = Events::with_capacity(1024);
     loop {
-        poll.poll(&mut events, None).expect("Cannot poll selector");
-        println!("connections: {}, events: {}", conns.len(), events.iter().count());
+        server.poll.poll(&mut events, None).expect("Cannot poll selector");
+        println!("connections: {}, events: {}", server.conns.len(), events.iter().count());
         for event in events.iter() {
             let token = event.token();
             println!("\t{:?}", event);
-            if !conns.contains(token.0) {
+            if !server.conns.contains(token.0) {
                 eprintln!("Unknown mio token: {}", token.0);
                 continue;
             }
-            match &mut conns[token.0] {
+            match &mut server.conns[token.0] {
                 &mut ConnState::TcpListener{ ref listener, ref start_state, poll_streams_for } => {
                     // clone to end borrow of conns so that we can insert streams
                     let listener = listener.clone();
@@ -256,7 +266,7 @@ fn main() {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                             Err(e) => eprintln!("Error accepting TCP connection: {}", e),
                             Ok((stream, addr)) => {
-                                if !limits.request_resources(addr, CONNECTION_COST) {
+                                if !server.limits.request_resources(addr, CONNECTION_COST) {
                                     // once the connection is ready to accept(),
                                     // the work to establish the connection has
                                     // already been performed by the OS. The
@@ -264,8 +274,8 @@ fn main() {
                                     // it, to not let it consume more resources.
                                     continue;
                                 }
-                                let entry = conns.vacant_entry();
-                                let res = poll.register(&stream,
+                                let entry = server.conns.vacant_entry();
+                                let res = server.poll.register(&stream,
                                     Token(entry.key()),
                                     poll_streams_for,
                                     PollOpt::edge(),
@@ -289,12 +299,12 @@ fn main() {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
                             eprintln!("Error reading data to discard: {}, closing", e);
-                            end_stream(token, &mut limits, &mut conns, &poll);
+                            server.end_stream(token);
                             break;
                         }
                         Ok(0) => {
                             eprintln!("ending {:?}", stream);
-                            end_stream(token, &mut limits, &mut conns, &poll);
+                            server.end_stream(token);
                             break;
                         }
                         Ok(len) => {
@@ -308,17 +318,17 @@ fn main() {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => {
                             eprintln!("Error sending qotd: {}, closing", e);
-                            end_stream(token, &mut limits, &mut conns, &poll);
+                            server.end_stream(token);
                             break;
                         }
                         Ok(0) => {
-                            end_stream(token, &mut limits, &mut conns, &poll);
+                            server.end_stream(token);
                             break;
                         }
                         Ok(len) => {
                             *sent += len;
                             if *sent >= QOTD.len() {
-                                end_stream(token, &mut limits, &mut conns, &poll);
+                                server.end_stream(token);
                                 break;
                             }
                         }
@@ -336,7 +346,7 @@ fn main() {
                                 }
                                 Ok(0) => break,
                                 Ok(len) => {
-                                    if limits.request_resources(*addr, 2*len) {
+                                    if server.limits.request_resources(*addr, 2*len) {
                                         unsent.extend(&read_buf[..len]);
                                         unsent.extend(&read_buf[..len]);
                                     }
@@ -353,17 +363,17 @@ fn main() {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                             Err(e) => {
                                 eprintln!("Error sending echo: {}, closing", e);
-                                limits.release_resources(*addr, unsent.len());
-                                end_stream(token, &mut limits, &mut conns, &poll);
+                                server.limits.release_resources(*addr, unsent.len());
+                                server.end_stream(token);
                                 break;
                             }
                             Ok(0) => {
-                                limits.release_resources(*addr, unsent.len());
-                                end_stream(token, &mut limits, &mut conns, &poll);
+                                server.limits.release_resources(*addr, unsent.len());
+                                server.end_stream(token);
                                 break;
                             }
                             Ok(len) => {
-                                limits.release_resources(*addr, len);
+                                server.limits.release_resources(*addr, len);
                                 unsent.drain(..len).for_each(|_| {} );
                             }
                         }
@@ -375,13 +385,13 @@ fn main() {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => {},
                         Err(e) => {
                             eprintln!("Error sending time32 to {}: {}, closing", addr, e);
-                            end_stream(token, &mut limits, &mut conns, &poll);
+                            server.end_stream(token);
                         }
                         Ok(len) => {
                             if len > 0  &&  len != 4 {
                                 eprintln!("Only sent {} of 4 bytes to {} o_O", len, addr);
                             }
-                            end_stream(token, &mut limits, &mut conns, &poll);
+                            server.end_stream(token);
                         }
                     }
                 }
@@ -397,7 +407,7 @@ fn main() {
                                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(e) => eprintln!("Error receiving UDP packet to echo: {}", e),
                                 Ok((len, from)) => {
-                                    if limits.allow_unacknowledged_send(from, 2*len) {
+                                    if server.limits.allow_unacknowledged_send(from, 2*len) {
                                         let msg = Rc::<[u8]>::from(&read_buf[..len]);
                                         unsent.push_back((from, msg.clone()));
                                         unsent.push_back((from, msg));
@@ -428,7 +438,7 @@ fn main() {
                                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(e) => eprintln!("Error receiving qotd UDP packet: {}", e),
                                 Ok((_, from)) => {
-                                    if limits.allow_unacknowledged_send(from, QOTD.len()) {
+                                    if server.limits.allow_unacknowledged_send(from, QOTD.len()) {
                                         outstanding.push_back(from);
                                     }
                                 }
@@ -450,7 +460,7 @@ fn main() {
                                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                                 Err(e) => eprintln!("Error receiving time (32bit) UDP packet: {}", e),
                                 Ok((_, from)) => {
-                                    if limits.allow_unacknowledged_send(from, 4) {
+                                    if server.limits.allow_unacknowledged_send(from, 4) {
                                         outstanding.push_back(from);
                                     }
                                 }
