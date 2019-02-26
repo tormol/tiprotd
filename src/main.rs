@@ -21,6 +21,7 @@ use client_limiter::ClientLimiter;
 
 use std::net::{SocketAddr, IpAddr, Ipv6Addr, Shutdown};
 use std::io::{self, ErrorKind, Read, Write, stdout};
+use std::error::Error;
 use std::rc::Rc;
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime};
@@ -39,7 +40,6 @@ const TIME32_PORT: u16 = 37; // only bother reading multiple times
 
 const QOTD: &[u8] = b"No quote today, the DB has gone away\n";
 
-const LOCALHOST: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
 const ANY: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 const NONRESERVED_PORT_OFFSET: u16 = 10_000;
 
@@ -94,6 +94,7 @@ struct Server {
     poll: Poll,
     conns: Slab<ConnState>,
     limits: ClientLimiter,
+    port_offset: Option<u16>,
 }
 impl Server {
     fn new() -> Self {
@@ -101,6 +102,7 @@ impl Server {
             poll: Poll::new().expect("Cannot create selector"),
             conns: Slab::with_capacity(512),
             limits: ClientLimiter::new(LIMITS_DURATION, UDP_SEND_LIMIT, RESOURCE_LIMIT),
+            port_offset: None,
         }
     }
 
@@ -125,19 +127,33 @@ impl Server {
         }
     }
 
+    fn try_bind<S: mio::Evented>(&mut self,  port: u16,  protocol_name: &str,
+            poll_for: Ready,  binder: fn(SocketAddr)->io::Result<S>,
+    ) -> Option<(S, slab::VacantEntry<ConnState>)> {
+        let on = SocketAddr::from((ANY, port+self.port_offset.unwrap_or(0)));
+        match binder(on) {
+            Ok(socket) => {
+                let entry = self.conns.vacant_entry();
+                self.poll.register(&socket, Token(entry.key()), poll_for, PollOpt::edge())
+                    .expect("Cannot register listener");
+                Some((socket, entry))
+            }
+            Err(ref e) if e.kind() == ErrorKind::PermissionDenied && self.port_offset == None => {
+                eprintln!("Lacks permission to listen on reserved ports, falling back to 10_000+port");
+                self.port_offset = Some(NONRESERVED_PORT_OFFSET);
+                self.try_bind(port, protocol_name, poll_for, binder)
+            }
+            Err(e) => {
+                eprintln!("Cannot listen on {}://{}: {}", protocol_name, on, e.description());
+                None
+            }
+        }
+    }
 
-    fn listen_tcp(&mut self,  on: SocketAddr,
-        start_state: TcpStreamState,  poll_streams_for: Ready,
-    ) {
-        let listener = TcpListener::bind(&on).unwrap_or_else(|e| {
-            eprintln!("Cannot listen to {}: {}", on, e);
-            let fallback = SocketAddr::new(LOCALHOST, on.port()+NONRESERVED_PORT_OFFSET);
-            eprintln!("Trying {} instead", fallback);
-            TcpListener::bind(&fallback).expect("Cannot listen to this port either. Aborting")
-        });
-        let entry = self.conns.vacant_entry();
-        self.poll.register(&listener, Token(entry.key()), Ready::readable(), PollOpt::edge())
-            .expect("Cannot register listener");
+    fn listen_tcp(&mut self,  port: u16,  start_state: TcpStreamState,  poll_streams_for: Ready) {
+        let (listener, entry) = self.try_bind(port, "tcp", Ready::readable(),
+            |addr| TcpListener::bind(&addr)
+        ).unwrap_or_else(|| std::process::exit(1) );
         entry.insert(ConnState::TcpListener {
             listener: Rc::new(listener),
             start_state,
@@ -145,17 +161,10 @@ impl Server {
         });
     }
 
-
-    fn listen_udp(&mut self,  on: SocketAddr,  state: UdpState,  poll_for: Ready) {
-        let socket = UdpSocket::bind(&on).unwrap_or_else(|e| {
-            eprintln!("Cannot bind to {}: {}", on, e);
-            let fallback = SocketAddr::new(LOCALHOST, on.port()+NONRESERVED_PORT_OFFSET);
-            eprintln!("Trying {} instead", fallback);
-            UdpSocket::bind(&fallback).expect("Cannot bind to this port either. Aborting")
-        });
-        let entry = self.conns.vacant_entry();
-        self.poll.register(&socket, Token(entry.key()), poll_for, PollOpt::edge())
-            .expect("Cannot register listener");
+    fn listen_udp(&mut self,  port: u16,  state: UdpState,  poll_for: Ready) {
+        let (socket, entry) = self.try_bind(port, "udp", poll_for,
+            |addr| UdpSocket::bind(&addr)
+        ).unwrap_or_else(|| std::process::exit(1) );
         entry.insert(ConnState::Udp { socket, state });
     }
 }
@@ -252,44 +261,36 @@ fn new_time32() -> [u8;4] {
 fn main() {
     let mut server = Server::new();
 
-    server.listen_tcp(
-        SocketAddr::new(ANY, ECHO_PORT),
+    server.listen_tcp(ECHO_PORT,
         TcpStreamState::Echo{unsent: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
-    server.listen_tcp(
-        SocketAddr::new(LOCALHOST, DISCARD_PORT),
+    server.listen_tcp(DISCARD_PORT,
         TcpStreamState::Discard,
         Ready::readable(),
     );
-    server.listen_tcp(
-        SocketAddr::new(ANY, QOTD_PORT),
+    server.listen_tcp(QOTD_PORT,
         TcpStreamState::Qotd{sent: 0},
         Ready::writable(),
     );
-    server.listen_tcp(
-        SocketAddr::new(ANY, TIME32_PORT),
+    server.listen_tcp(TIME32_PORT,
         TcpStreamState::Time32,
         Ready::writable(),
     ); // FIXME make this Oneshot (create a builder)
 
-    server.listen_udp(
-        SocketAddr::new(ANY, ECHO_PORT),
+    server.listen_udp(ECHO_PORT,
         UdpState::Echo{unsent: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
-    server.listen_udp(
-        SocketAddr::new(ANY, DISCARD_PORT),
+    server.listen_udp(DISCARD_PORT,
         UdpState::Discard,
         Ready::readable(),
     );
-    server.listen_udp(
-        SocketAddr::new(ANY, QOTD_PORT),
+    server.listen_udp(QOTD_PORT,
         UdpState::Qotd{outstanding: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
-    server.listen_udp(
-        SocketAddr::new(ANY, TIME32_PORT),
+    server.listen_udp(TIME32_PORT,
         UdpState::Time32{outstanding: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
