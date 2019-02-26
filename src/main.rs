@@ -175,6 +175,51 @@ fn send_udp(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  prot: &str) -> boo
     true
 }
 
+fn do_tcp_echo(server: &mut Server,  read_buf: &mut[u8],  token: Token,  readiness: Ready) {
+    let (stream, addr, unsent) = match &mut server.conns[token.0] {
+        ConnState::TcpStream{ stream, addr, state: TcpStreamState::Echo{unsent} } => {
+            (stream, *addr, unsent)
+        },
+        _ => panic!("connection is not a TCP echo stream"),
+    };
+    if readiness.is_readable() {
+        loop {
+            match stream.read(read_buf) {
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Ok(len) if len > 0 => {
+                    if server.limits.request_resources(addr, 2*len) {
+                        unsent.extend(&read_buf[..len]);
+                        unsent.extend(&read_buf[..len]);
+                    }
+                }
+                end => {
+                    let discard = unsent.len();
+                    server.end_stream(token, discard, end, "reading bytes to echo from");
+                    return;
+                }
+            }
+        }
+    }
+    // if the socket is write ready but we don't have anything to write,
+    // we cannot drain the readiness, so always try to write when we get some
+    // if there is data to write, we need to try writing it even if no more
+    // data is received
+    while !unsent.is_empty() {
+        match stream.write(unsent.as_slices().0) {
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+            Ok(len @ 1..=std::usize::MAX) => {
+                server.limits.release_resources(addr, len);
+                unsent.drain(..len).for_each(|_| {} );
+            }
+            end => {
+                let discard = unsent.len(); // make borrowck happy
+                server.end_stream(token, discard, end, "sending echo to");
+                break;
+            }
+        }
+    }
+}
+
 fn new_time32() -> [u8;4] {
     let now = SystemTime::elapsed(&SystemTime::UNIX_EPOCH).unwrap_or_else(|ste| {
         // Pre-1970 time? The system might have fallen into my own trap.
@@ -325,44 +370,8 @@ fn main() {
                         }
                     }
                 }
-                ConnState::TcpStream{ stream, addr, state: TcpStreamState::Echo{unsent} } => {
-                    if event.readiness().is_readable() {
-                        loop {
-                            match stream.read(&mut read_buf) {
-                                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                                Err(e) => {
-                                    eprintln!("Error reading data to echo from {}: {}", addr, e);
-                                    eprintln!("\tHope the write errors too");
-                                    break;
-                                }
-                                Ok(0) => break,
-                                Ok(len) => {
-                                    if server.limits.request_resources(*addr, 2*len) {
-                                        unsent.extend(&read_buf[..len]);
-                                        unsent.extend(&read_buf[..len]);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // if the socket is write ready but we don't have anything to write,
-                    // we cannot drain the readiness, so always try to write when we get some
-                    // if there is data to write, we need to try writing it even if no more
-                    // data is received
-                    while !unsent.is_empty() {
-                        match stream.write(unsent.as_slices().0) {
-                            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Ok(len @ 1..=std::usize::MAX) => {
-                                server.limits.release_resources(*addr, len);
-                                unsent.drain(..len).for_each(|_| {} );
-                            }
-                            end => {
-                                let discard = unsent.len(); // make borrowck happy
-                                server.end_stream(token, discard, end, "sending echo to");
-                                break;
-                            }
-                        }
-                    }
+                ConnState::TcpStream{ state: TcpStreamState::Echo{..}, .. } => {
+                    do_tcp_echo(&mut server, &mut read_buf, token, event.readiness());
                 }
                 ConnState::TcpStream{ stream, addr, state: TcpStreamState::Time32 } => {
                     let sometime = new_time32();

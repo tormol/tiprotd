@@ -133,7 +133,7 @@ impl From<Ipv6Addr> for AssignedAddr {
             // move 0:xxxx:: to ::xxxx:0.0.0.0; selects ff9b from well-known and is 0 otherwise
             let u1 = (whole >> 64) as u64 & 0x0000_ffff_00_00_00_00;
             // move ::xxxx:0:0.0.0.0 to ::xxxx:0.0.0.0; selects ffff from SIIT and is 0 otherwise
-            let u4 = (whole >> 8) as u64 & 0x0000_ffff_00_00_00_00;
+            let u4 = (whole >> 16) as u64 & 0x0000_ffff_00_00_00_00;
             AssignedAddr(bare | u1 | u4)
         } else {
             // doesn't need any special casing
