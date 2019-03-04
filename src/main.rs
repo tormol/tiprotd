@@ -19,7 +19,7 @@ mod assigned_addr;
 mod client_limiter;
 use client_limiter::ClientLimiter;
 
-use std::net::{SocketAddr, IpAddr, Ipv6Addr, Shutdown};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, Shutdown};
 use std::io::{self, ErrorKind, Read, Write, stdout};
 use std::error::Error;
 use std::rc::Rc;
@@ -178,10 +178,14 @@ impl Server {
 fn send_udp(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  prot: &str) -> bool {
     match from.send_to(msg, to) {
         Err(ref e) if e.kind() == ErrorKind::WouldBlock => return false,
-        Err(e) => eprintln!("udp://{} error sending {} response: {}", to, prot, e.description()),
+        Err(e) => {
+            eprintln!("udp://{} error sending {} response: {}",
+                native_addr(*to), prot, e.description()
+            );
+        }
         Ok(len) if len != msg.len() => {
             eprintln!("udp://{} could only send {}/{} bytes of {} response",
-                to, len, msg.len(), prot
+                native_addr(*to), len, msg.len(), prot
             );
         },
         Ok(_) => {}
@@ -271,6 +275,26 @@ fn new_time32() -> [u8;4] {
     ]
 }
 
+/// Converts ::ffff:0.0.0.0/96 and ::0.0.0.0/96 ( except ::1 and ::) to IPv4 socket addresses.
+///
+/// When listening on :: IPv4 clienst are represented as IPv4-mapped addresses
+/// (::ffff:0.0.0.0). These are less readable when printed, and might not be
+/// detected as eg. multicast or loopback.
+///
+/// Using std's Ipv6Addr.to_ipv4() directly would convert some actual IPv6
+/// addresses such as ::1 and :: because it also converts ::0.0.0.0/96
+/// (IPv4-compatible addresses).
+fn native_addr(addr: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = addr {
+        if let Some(v4) = v6.ip().to_ipv4() {
+            if v4 > Ipv4Addr::new(0, 0, 0, 255) && v6.scope_id() == 0 && v6.flowinfo() == 0 {
+                return SocketAddr::from((v4, v6.port()));
+            }
+        }
+    }
+    addr
+}
+
 fn main() {
     let mut server = Server::new();
 
@@ -347,6 +371,7 @@ fn main() {
                                 if let Err(e) = res {
                                     eprintln!("Cannot register TCP connection: {}", e);
                                 } else {
+                                    let addr = native_addr(addr);
                                     eprintln!("tcp://{} {} connection established", addr, name);
                                     entry.insert(ConnState::TcpStream {
                                         stream,
@@ -409,7 +434,9 @@ fn main() {
                                 Err(e) => eprintln!("Error receiving UDP packet to echo: {}", e),
                                 Ok((len, from)) => {
                                     if server.limits.allow_unacknowledged_send(from, 2*len) {
-                                        eprintln!("udp://{} sends {} bytes to echo", from, len);
+                                        eprintln!("udp://{} sends {} bytes to echo",
+                                            native_addr(from), len
+                                        );
                                         let msg = Rc::<[u8]>::from(&read_buf[..len]);
                                         unsent.push_back((from, msg.clone()));
                                         unsent.push_back((from, msg));
@@ -431,9 +458,10 @@ fn main() {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(e) => eprintln!("Error receiving UDP packet to discard: {}", e),
                         Ok((len, from)) => {
+                            let addr = native_addr(from);
                             // TODO rate limit this to prevent filling up the disk
-                            eprintln!("udp://{} sends {} bytes to discard", from, len);
-                            anti_discard(from, "udp", &read_buf[..len]);
+                            eprintln!("udp://{} sends {} bytes to discard", addr, len);
+                            anti_discard(addr, "udp", &read_buf[..len]);
                         }
                     }
                 }
@@ -445,7 +473,9 @@ fn main() {
                                 Err(e) => eprintln!("Error receiving QOTD UDP packet: {}", e),
                                 Ok((len, from)) => {
                                     if server.limits.allow_unacknowledged_send(from, QOTD.len()) {
-                                        eprintln!("udp://{} sends {} bytes for QOTD", from, len);
+                                        eprintln!("udp://{} sends {} bytes for QOTD",
+                                            native_addr(from), len
+                                        );
                                         outstanding.push_back(from);
                                     }
                                 }
@@ -468,7 +498,9 @@ fn main() {
                                 Err(e) => eprintln!("Error receiving time (32bit) UDP packet: {}", e),
                                 Ok((len, from)) => {
                                     if server.limits.allow_unacknowledged_send(from, 4) {
-                                        eprintln!("udp://{} sends {} bytes for time32", from, len);
+                                        eprintln!("udp://{} sends {} bytes for time32",
+                                            native_addr(from), len
+                                        );
                                         outstanding.push_back(from);
                                     }
                                 }
