@@ -114,15 +114,14 @@ impl Server {
             ConnState::TcpStream{stream, addr, ..} => (stream, addr),
             _ => panic!("Removed wrong type of token")
         };
+        self.limits.release_resources(addr, CONNECTION_COST+and_release);
         if let Err(e) = cause {
             eprintln!("tcp://{} error {}: {}, closing", addr, err_op, e.description());
-        }
-        self.limits.release_resources(addr, CONNECTION_COST+and_release);
-        // TODO if length < 1/4 capacaity and above some minimum, recreate slab and reregister;
-        // shrink_to_fit() doesn't do much: https://github.com/carllerche/slab/issues/38
-        if let Err(e) = stream.shutdown(Shutdown::Both) {
+        } else if let Err(e) = stream.shutdown(Shutdown::Both) {
             eprintln!("tcp://{} error shutting down socket: {}", addr, e);
         }
+        // TODO if length < 1/4 capacaity and above some minimum, recreate slab and reregister;
+        // shrink_to_fit() doesn't do much: https://github.com/carllerche/slab/issues/38
         if let Err(e) = self.poll.deregister(&stream) {
             eprintln!("tcp://{} error deregistering stream: {}", addr, e);
         }
