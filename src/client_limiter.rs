@@ -83,9 +83,15 @@ impl ClientLimiter {
         if now > self.window_end {
             // not reusing the map is important to allow the allocation to shrink
             self.stats = self.stats.iter()
-                .filter(|&(_,v)| v.resources != 0 )
-                .map(|(&k, &ClientStats { resources, .. })| {
-                    (k, ClientStats {
+                .inspect(|&(ip, stats)| {
+                    if stats.unacknowledged_sent >= self.unacknowledged_send_limit
+                    || stats.exceeded_resource_limits {
+                        eprintln!("Un-blacklisting {}", ip);
+                    }
+                 })
+                .filter(|&(_, stats)| stats.resources != 0 )
+                .map(|(&ip, &ClientStats { resources, .. })| {
+                    (ip, ClientStats {
                         resources,
                         ..ClientStats::default()
                     })
