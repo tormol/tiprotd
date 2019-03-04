@@ -265,15 +265,15 @@ fn new_time32() -> [u8;4] {
     // mess with the response, switch type every ~four minutes
     let sometime = match random_2 {
         0 => now & 0xff, // it's the 70's again
-        1 => 0x7fffff00 | (now & 0xff), // can you handle it
-        2 => now.wrapping_sub(60*60*24*365*100), // a blast from the past
+        1 => 0x7fffff00 | now, // can you handle it
+        2 => now.wrapping_sub(60*60*24*(365*100+100/4)), // a blast from the past
         3 => now ^ 0xff, // going backwards
         _ => unreachable!()
     };
     [// as bytes in network order
-        (sometime >> 24) as u8 & 0xff,
-        (sometime >> 16) as u8 & 0xff,
-        (sometime >>  8) as u8 & 0xff,
+        (sometime >> 24) as u8,
+        (sometime >> 16) as u8,
+        (sometime >>  8) as u8,
         sometime as u8
     ]
 }
