@@ -17,7 +17,7 @@ I plan to also implement at least daytime (port 13) and TCPMUX (port 1),
 and want to also support the transport layer protocols SCTP, DCCP and UDPlite
 as well as unix domain sockets (including SOCK_SEQPACKET)
 
-# Invocation
+## Invocation
 
 It currently doesn't support any configuration and ignore command line arguments.
 
@@ -33,6 +33,18 @@ cargo build --release
 sudo setcap CAP_NET_BIND_SERVICE=+eip target/release/tiprotd
 sudo -u nobody target/release/tiprotd
 ```
+
+## Clients
+
+For most protocols, netcat or socat is all you need;
+For example use `nc -u localhost 10007` for UDP echo running on an unprivileged port or
+`socat - TCP6:[::1]:10017` for TCP QOTD.
+
+Tip: to make netcat terminate after receiving the TCP response, pass it the `-N` flag and redirect stdin to /dev/null: `nc -N 127.0.0.1 10017 </dev/null`
+
+In clients/ there is a client that decodes the response from the binary *time* protocol.
+
+To find the listening sockets, (on Linux) run `ss --listening --query inet --numeric  -processes` or `sudo netstat --listening --numeric-ports --inet --inet6 --programs`.
 
 ## License
 
