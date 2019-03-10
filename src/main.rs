@@ -61,7 +61,7 @@ const CONNECTION_COST: usize = 2000; // guess
 
 #[derive(Clone)]
 enum TcpStreamState {
-    Echo{ unsent: VecDeque<u8> },
+    Echo{ unsent: VecDeque<u8>, recv_shutdown: bool },
     Discard,
     Qotd{ sent: usize },
     Time32, // assume it can be sent in one go, figure out response at send time
@@ -197,13 +197,13 @@ fn send_udp(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  prot: &str) -> boo
 }
 
 fn do_tcp_echo(server: &mut Server,  read_buf: &mut[u8],  token: Token,  readiness: Ready) {
-    let (stream, addr, unsent) = match &mut server.conns[token.0] {
-        ConnState::TcpStream{ stream, addr, state: TcpStreamState::Echo{unsent} } => {
-            (stream, *addr, unsent)
+    let (stream, addr, unsent, recv_shutdown) = match &mut server.conns[token.0] {
+        ConnState::TcpStream{ stream, addr, state: TcpStreamState::Echo{ unsent, recv_shutdown } } => {
+            (stream, *addr, unsent, recv_shutdown)
         },
         _ => panic!("connection is not a TCP echo stream"),
     };
-    if readiness.is_readable() {
+    if !*recv_shutdown && readiness.is_readable() {
         loop {
             match stream.read(read_buf) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -212,6 +212,10 @@ fn do_tcp_echo(server: &mut Server,  read_buf: &mut[u8],  token: Token,  readine
                         unsent.extend(&read_buf[..len]);
                         unsent.extend(&read_buf[..len]);
                     }
+                }
+                Ok(0) => {
+                    *recv_shutdown = true;
+                    break;
                 }
                 end => {
                     let discard = unsent.len();
@@ -235,9 +239,12 @@ fn do_tcp_echo(server: &mut Server,  read_buf: &mut[u8],  token: Token,  readine
             end => {
                 let discard = unsent.len(); // make borrowck happy
                 server.end_stream(token, discard, end, "sending echo");
-                break;
+                return;
             }
         }
+    }
+    if *recv_shutdown && unsent.is_empty() {
+        server.end_stream(token, 0, Ok(0), "finishing echo");
     }
 }
 
@@ -306,7 +313,7 @@ fn main() {
     let mut server = Server::new();
 
     server.listen_tcp(ECHO_PORT, "echo",
-        TcpStreamState::Echo{unsent: VecDeque::new()},
+        TcpStreamState::Echo{unsent: VecDeque::new(), recv_shutdown: false},
         Ready::readable() | Ready::writable(),
     );
     server.listen_tcp(DISCARD_PORT, "discard",
