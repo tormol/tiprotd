@@ -6,3 +6,6 @@ tcp: tcp.c
 
 time32: time32.rs
 	rustc -o time32 time32.rs
+
+mq: mq.c
+	$(CC) -o mq mq.c -lrt

@@ -10,3 +10,6 @@ edition = "2018"
 mio = "0.6"
 slab = "0.4"
 chrono = "0.4"
+
+[target.'cfg(target_os="linux")'.dependencies]
+posixmq = {path = "posixmq/", features=["mio"]}

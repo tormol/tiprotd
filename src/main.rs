@@ -31,6 +31,11 @@ extern crate mio;
 use mio::{Token, Poll, PollOpt, Ready, Events};
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 
+#[cfg(target_os = "linux")]
+extern crate posixmq;
+#[cfg(target_os = "linux")]
+use posixmq::PosixQueue;
+
 extern crate slab;
 use slab::Slab;
 
@@ -92,6 +97,10 @@ enum ConnState {
         /// after IO errors.
         addr: SocketAddr,
         state: TcpStreamState,
+    },
+    #[cfg(target_os = "linux")]
+    MqDiscard {
+        mq: PosixQueue,
     },
 }
 
@@ -196,6 +205,28 @@ fn send_udp(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  prot: &str) -> boo
     true
 }
 
+#[cfg(target_os = "linux")]
+fn setup_mq_discard(server: &mut Server) {
+    let name = std::ffi::CStr::from_bytes_with_nul(b"/discard\0").unwrap();
+    let mut opts = posixmq::OpenOptions::readonly();
+    opts.or_create(0o666, 0, 0);
+    opts.nonblocking();
+    let mq = match PosixQueue::open(name, &opts) {
+        Ok(mq) => mq,
+        Err(e) => {
+            eprintln!("Cannot open posix message queue /discard: {}", e.description());
+            return;
+        }
+    };
+    let entry = server.conns.vacant_entry();
+    let res = server.poll.register(&mq, Token(entry.key()), Ready::readable(), PollOpt::edge());
+    if let Err(e) = res {
+        eprintln!("Cannot register posix queue: {}, skipping", e);
+        return;
+    }
+    entry.insert(ConnState::MqDiscard{ mq });
+}
+
 fn do_tcp_echo(server: &mut Server,  read_buf: &mut[u8],  token: Token,  readiness: Ready) {
     let (stream, addr, unsent, recv_shutdown) = match &mut server.conns[token.0] {
         ConnState::TcpStream{ stream, addr, state: TcpStreamState::Echo{ unsent, recv_shutdown } } => {
@@ -248,7 +279,7 @@ fn do_tcp_echo(server: &mut Server,  read_buf: &mut[u8],  token: Token,  readine
     }
 }
 
-fn anti_discard(from: SocketAddr,  protocol: &str,  bytes: &[u8]) {
+fn anti_discard(from: &Display,  protocol: &str,  bytes: &[u8]) {
     print!("{} {}://{} discards {} bytes: ", now(), protocol, from, bytes.len());
     stdout().write(bytes).expect("Writing to stdout failed");
     if bytes.last().cloned() != Some(b'\n') {
@@ -345,8 +376,10 @@ fn main() {
         UdpState::Time32{outstanding: VecDeque::new()},
         Ready::readable() | Ready::writable(),
     );
+    #[cfg(target_os = "linux")]
+    setup_mq_discard(&mut server);
 
-    let mut read_buf = [0u8; 4096];
+    let mut read_buf = [0u8; 1024*16];
     let mut events = Events::with_capacity(1024);
     loop {
         server.poll.poll(&mut events, None).expect("Cannot poll selector");
@@ -403,7 +436,7 @@ fn main() {
                 &mut ConnState::TcpStream{ ref mut stream, addr, state: TcpStreamState::Discard } => loop {
                     match stream.read(&mut read_buf) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-                        Ok(len) if len > 0 => anti_discard(addr, "tcp", &read_buf[..len]),
+                        Ok(len) if len > 0 => anti_discard(&addr, "tcp", &read_buf[..len]),
                         end => {
                             server.end_stream(token, 0, end, "reading bytes to discard");
                             break;
@@ -479,7 +512,7 @@ fn main() {
                             eprintln!("{} udp://{} sends {} bytes to discard",
                                 now(), addr, len
                             );
-                            anti_discard(addr, "udp", &read_buf[..len]);
+                            anti_discard(&addr, "udp", &read_buf[..len]);
                         }
                     }
                 }
@@ -532,6 +565,18 @@ fn main() {
                         } else {
                             break;
                         }
+                    }
+                }
+
+                #[cfg(target_os = "linux")]
+                ConnState::MqDiscard{ mq } => loop {
+                    match mq.receive(&mut read_buf) {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            eprintln!("Error receiving posix message: {}", e);
+                            std::process::exit(1);
+                        },
+                        Ok((len, _priority)) => anti_discard(&"/discard", "mq", &read_buf[..len]),
                     }
                 }
             }
