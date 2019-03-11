@@ -34,7 +34,7 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "linux")]
 extern crate posixmq;
 #[cfg(target_os = "linux")]
-use posixmq::PosixQueue;
+use posixmq::PosixMq;
 
 extern crate slab;
 use slab::Slab;
@@ -100,7 +100,7 @@ enum ConnState {
     },
     #[cfg(target_os = "linux")]
     MqDiscard {
-        mq: PosixQueue,
+        mq: PosixMq,
     },
 }
 
@@ -207,11 +207,14 @@ fn send_udp(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  prot: &str) -> boo
 
 #[cfg(target_os = "linux")]
 fn setup_mq_discard(server: &mut Server) {
-    let name = std::ffi::CStr::from_bytes_with_nul(b"/discard\0").unwrap();
-    let mut opts = posixmq::OpenOptions::readonly();
-    opts.or_create(0o666, 0, 0);
-    opts.nonblocking();
-    let mq = match PosixQueue::open(name, &opts) {
+    let res = posixmq::OpenOptions::readonly()
+        .permissions(0o622)
+        .create()
+        .max_msg_len(8192)
+        .capacity(2)
+        .nonblocking()
+        .open("/discard");
+    let mq = match res {
         Ok(mq) => mq,
         Err(e) => {
             eprintln!("Cannot open posix message queue /discard: {}", e.description());
@@ -576,7 +579,7 @@ fn main() {
                             eprintln!("Error receiving posix message: {}", e);
                             std::process::exit(1);
                         },
-                        Ok((len, _priority)) => anti_discard(&"/discard", "mq", &read_buf[..len]),
+                        Ok((_priority, len)) => anti_discard(&"/discard", "mq", &read_buf[..len]),
                     }
                 }
             }
