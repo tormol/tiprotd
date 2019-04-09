@@ -42,9 +42,10 @@ For example use `nc -u localhost 10007` for UDP echo running on an unprivileged 
 
 Tip: to make netcat terminate after receiving the TCP response, pass it the `-N` flag and redirect stdin to /dev/null: `nc -N 127.0.0.1 10017 </dev/null`
 
-In clients/ there is a client that decodes the response from the binary *time* protocol.
-
 To find the listening sockets, (on Linux) run `ss --listening --query inet --numeric  -processes` or `sudo netstat --listening --numeric-ports --inet --inet6 --programs`.
+
+In clients/ there are protocol-specific clients and simple programs I wrote to
+get familiar with the transport layer protocols and sockets programming in general.
 
 ## License
 

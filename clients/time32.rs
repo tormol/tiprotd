@@ -1,3 +1,6 @@
+//! A simple client for the binary time32 protocol, supporting both TCP,
+//! UDP and reading from stdin.
+
 use std::env::args_os;
 use std::str::FromStr;
 use std::net::{TcpStream, UdpSocket};
