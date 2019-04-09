@@ -2,10 +2,10 @@ CC=gcc
 CFLAGS=-Wall -Wextra -Wpedantic -std=gnu11 -g
 
 tcp: tcp.c
-	$(CC) -o tcp tcp.c
+	$(CC) -o tcp tcp.c $(CFLAGS)
 
 time32: time32.rs
 	rustc -o time32 time32.rs
 
 mq: mq.c
-	$(CC) -o mq mq.c -lrt
+	$(CC) -o mq mq.c -lrt $(CFLAGS)
