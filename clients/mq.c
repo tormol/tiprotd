@@ -1,12 +1,19 @@
-// Wraps the POSIX API as thinly as possible to expose error conditions that a
-// Rust wrapper must also handle.
-// Compile with `gcc -Wall -Wextra -Wpedantic -std=c11 -g -o mqc mq.c -lrt`
+/* Copyright 2019 Torbjørn Birch Moltu
+ *
+ * Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+ * http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+ * http://opensource.org/licenses/MIT>, at your option. This file may not be
+ * copied, modified, or distributed except according to those terms.
+ */
 
-#define _GNU_SOURCE         /* See feature_test_macros(7) */
-#include <unistd.h>
-#include <sys/syscall.h>
-//#define _POSIX_C_SOURCE 200809L // needed for O_CLOEXEC
+// A command line program for interacting with posix message queues.
+// Wraps the C functions thinly to expose as many error conditions as possible.
+// Compile with gcc -o mq mq.c -lrt -std=c11 -Wall -Wextra -Wpedantic -g
+
+#define _POSIX_C_SOURCE 200809L // needed for O_CLOEXEC
 #include <mqueue.h>
+#include <time.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -14,7 +21,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 
 void printerr(int err, char* action, char*(*specific)(int), int ex) __attribute__((noreturn));
 void printerr(int err, char* action, char*(*specific)(int), int ex) {
@@ -26,20 +32,23 @@ void printerr(int err, char* action, char*(*specific)(int), int ex) {
 
 void usage() __attribute__((noreturn));
 void usage() {
-    fprintf(stderr, "mqc - work with POSIX message queues\n");
+    fprintf(stderr, "mq - work with POSIX message queues\n");
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "\tmqc ls : list all existing queues\n\t\t(uses /dev/mqueue/)\n");
-    fprintf(stderr, "\tmqc rm /mqname... : mq_unlink() wrapper\n\t\tsupports multiple queues\n");
-    fprintf(stderr, "\tmqc stat (/mqname openmode)... : mq_getattr() wrapper\n\t\tsupports multiple queues\n");
-    fprintf(stderr, "\tmqc read /mqname openmode : call mq_recv() once\n");
-    fprintf(stderr, "\t\tprints priority before message contents\n");
-    fprintf(stderr, "\tmqc write /mqname openmode priority message: call mq_send() once\n");
+    fprintf(stderr, "\tmq ls : list all existing queues\n\t\t(uses /dev/mqueue/)\n");
+    fprintf(stderr, "\tmq rm /mqname... : mq_unlink() wrapper\n\t\tsupports multiple queues\n");
+    fprintf(stderr, "\tmq stat (/mqname openmode)... : mq_getattr() wrapper\n\t\tsupports multiple queues\n");
+    fprintf(stderr, "\tmq read /mqname openmode : call mq_receive() once\n");
+    fprintf(stderr, "\t\tprints priority before the message content\n");
+    fprintf(stderr, "\tmq read /mqname openmode timeout: call mq_timedreceive() once\n");
+    fprintf(stderr, "\t\ttimeout is in seconds and must be an integer\n");
+    fprintf(stderr, "\tmq write /mqname openmode priority message: call mq_send() once\n");
+    fprintf(stderr, "\tmq write /mqname openmode priority message timeout: call mq_timedsend() once\n");
     fprintf(stderr, "openmode format: flags[perms][,capacity,size]\n");
     fprintf(stderr, "\tflags: r=O_RDONLY, w=O_WRONLY, d=O_RDWR, c=O_CREAT, e=O_EXCL\n");
     fprintf(stderr, "\t       n=O_NONBLOCK, s=O_CLOEXEC\n");
     fprintf(stderr, "\tIf there is only a single number it is used for permissions,\n");
     fprintf(stderr, "\tif there are two they are used for capacity and size limit.\n");
-    fprintf(stderr, "\tExamples: d wcn8,1024 rce700 rce733,10,200\n");
+    fprintf(stderr, "\tExamples: 'd' 'wcn8,1024' 'rce700' 'rce733,10,200'\n");
     exit(1);
 }
 
@@ -121,10 +130,20 @@ mqd_t parseopts_open(char* qname, char* qopts) {
     }
 
     mqd_t q = mq_open(qname, opts, perms, caps_ptr);
-    if (q == -1) {
+    if (q == (mqd_t)-1) {
         printerr(errno, "opening", openerrdesc, 1);
     }
     return q;
+}
+
+struct timespec parse_timeout(char *timeout) {
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline)) {
+        perror("Unable to get current system time.");
+        exit(1);
+    }
+    deadline.tv_sec += atoi(timeout);
+    return deadline;
 }
 
 
@@ -161,6 +180,7 @@ char* unlinkerrdesc(int err) {
 }
 
 int main(int argc, char* const* const argv) {
+    mqd_t q = (mqd_t)-1;
     if (argc < 2) {
         usage();
     } else if (!strcmp(argv[1], "ls") && argc == 2) {
@@ -175,16 +195,13 @@ int main(int argc, char* const* const argv) {
             }
         }
         closedir(dd);
-    } else if (!strcmp(argv[1], "rm") && argc > 2) {
-        // if (syscall(SYS_mq_unlink, NULL) == -1) {
-        //     printerr(errno, "raw-deleting", unlinkerrdesc, 1);
-        // }
+    } else if ((!strcmp(argv[1], "rm") || !strcmp(argv[1], "unlink")) && argc > 2) {
         for (int i=2; i<argc; i++) {
             if (mq_unlink(argv[i])) {
                 printerr(errno, "deleting", unlinkerrdesc, 1);
             }
         }
-    } else if (!strcmp(argv[1], "stat") && argc > 2 && argc%2 == 0) {
+    } else if ((!strcmp(argv[1], "stat") || !strcmp(argv[1], "getattr")) && argc > 2 && argc%2 == 0) {
         for (int i=2; i<argc; i+=2) {
             mqd_t q = parseopts_open(argv[i], argv[i+1]);
             struct mq_attr attrs;
@@ -192,45 +209,52 @@ int main(int argc, char* const* const argv) {
                 perror("bug or undocumented error!");
                 exit(1);
             }
-            printf("maxmsg: %ld\nmsgsize: %ld\ncurmsgs: %ld\nflags: %ld\n",
-                attrs.mq_maxmsg, attrs.mq_msgsize, attrs.mq_curmsgs, attrs.mq_flags
+            printf("maxmsg: %ld\nmsgsize: %ld\ncurmsgs: %ld\nflags: 0x%lx\n (nonblocking: %s)\n",
+                (long)attrs.mq_maxmsg, (long)attrs.mq_msgsize, (long)attrs.mq_curmsgs,
+                (long)attrs.mq_flags, attrs.mq_flags & O_NONBLOCK ? "yes" : "no"
             );
-            if (mq_close(q)) {
-                perror("close queue");
-                exit(1);
-            }
        }
-       // there is no point in exposing mq_setattr(), because the only thing it
-       // can change is O_NONBLOCK
-    } else if (!strcmp(argv[1], "read") && argc == 4) {
+       // there is not much point in exposing mq_setattr(), because
+       // the only thing it can change is O_NONBLOCK
+    } else if ((!strcmp(argv[1], "read") || !strcmp(argv[1], "receive"))
+    && (argc == 4 || argc == 5)) {
         char buf[1024*1024];
         unsigned int prio;
-        mqd_t q = parseopts_open(argv[2], argv[3]);
-        ssize_t len = mq_receive(q, buf, 1024*1024, &prio);
+        ssize_t len;
+        q = parseopts_open(argv[2], argv[3]);
+        if (argc == 4) {
+            len = mq_receive(q, buf, 1024*1024, &prio);
+        } else {
+            struct timespec deadline = parse_timeout(argv[4]);
+            len = mq_timedreceive(q, buf, 1024*1024, &prio, &deadline);
+        }
         if (len == -1) {
             printerr(errno, "receiving", recverrdesc, 1);
-        } else if (mq_close(q)) {
-            perror("close queue");
-            exit(1);
         }
         printf("%2d ", prio);
         fwrite(&buf, len, 1, stdout);
         putchar('\n');
-    } else if (!strcmp(argv[1], "write") && argc == 6) {
+    } else if ((!strcmp(argv[1], "write") || !strcmp(argv[1], "send")) && argc == 6) {
         mqd_t q = parseopts_open(argv[2], argv[3]);
         if (mq_send(q, argv[5], strlen(argv[5]), atoi(argv[4]))) {
             printerr(errno, "sending", senderrdesc, 1);
-        } else if (mq_close(q)) {
-            perror("close queue");
-            exit(1);
+        }
+    } else if ((!strcmp(argv[1], "write") || !strcmp(argv[1], "send")) && argc == 7) {
+        mqd_t q = parseopts_open(argv[2], argv[3]);
+        struct timespec deadline = parse_timeout(argv[6]);
+        if (mq_timedsend(q, argv[5], strlen(argv[5]), atoi(argv[4]), &deadline)) {
+            printerr(errno, "sending", senderrdesc, 1);
         }
     } else {
         fprintf(stderr, "unknown operation or wrong number of arguments\n");
         usage();
     }
-    // TODO support timeouts for read and write
-    // TODO make stat smart and try to show permissions too
-    // TODO read from or write to first available (using select or aio or epoll)
 
+    if (q != (mqd_t)-1) {
+        if (mq_close(q)) {
+            perror("close queue");
+            return 1;
+        }
+    }
     return 0;
 }
