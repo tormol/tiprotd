@@ -9,6 +9,7 @@
 #include <sys/select.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <signal.h>
 #include <errno.h>
 #include <string.h> // strlen() and strerror()
 #include <stdio.h>
@@ -279,6 +280,18 @@ ssize_t echo(int conn, struct sockaddr_in6 *_remote, void *_nothing) {
     }
 }
 
+int initial_stdin_flags; // is initialized by talk_rasync() before use
+
+void restore_stdin_flags() {
+    fcntl(STDIN, F_SETFL, initial_stdin_flags);
+    // ignore errors - program is terminating already and printf() isn't signal-safe
+}
+
+void handler(int signal) {
+    restore_stdin_flags();
+    raise(signal); // continue to default handler (this handler was registered as oneshot)
+}
+
 /// send stdin to socket and socket to stdout, using select() to avoid blocking on either side.
 ssize_t talk_rasync(int conn, struct sockaddr_in6 *_remote, void *_nothing) {
     UNUSED(_remote);
@@ -289,8 +302,17 @@ ssize_t talk_rasync(int conn, struct sockaddr_in6 *_remote, void *_nothing) {
     checkerr(fstat(STDIN, &stdinfo), "stat() stdin");
     // not sure about block devices, so treat it as file just in case
     if ((stdinfo.st_mode & S_IFMT) != S_IFREG && (stdinfo.st_mode & S_IFMT) != S_IFBLK) {
-        int flags = checkerr(fcntl(STDIN, F_GETFL, 0), "get flags for stdin");
-        checkerr(fcntl(STDIN, F_SETFL, flags | O_NONBLOCK), "make stdin nonblocking");
+        initial_stdin_flags = checkerr(fcntl(STDIN, F_GETFL, 0), "get flags for stdin");
+        checkerr(fcntl(STDIN, F_SETFL, initial_stdin_flags | O_NONBLOCK), "make stdin nonblocking");
+        // restore blocking-ness on exit, because neither the shell nor `reset` does that.
+        // (not doing this breaks `git add -p` and other commands, `bash` can be used to restore.)
+        atexit(restore_stdin_flags);
+        struct sigaction act;
+        sigemptyset(&act.sa_mask);
+        act.sa_handler = handler;
+        act.sa_flags = SA_RESETHAND; // resume with default handler after restoring
+        sigaction(SIGINT, &act, NULL);
+        sigaction(SIGTERM, &act, NULL);
     }
     char buf[1024];
     ssize_t received;
