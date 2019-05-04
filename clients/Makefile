@@ -7,6 +7,9 @@ tcp: tcp.c
 udp: udp.c
 	$(CC) -o udp udp.c $(CFLAGS)
 
+udplite: udplite.c
+	$(CC) -o udplite udplite.c $(CFLAGS)
+
 time32: time32.rs
 	rustc -o time32 time32.rs
 
