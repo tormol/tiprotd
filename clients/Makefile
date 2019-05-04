@@ -1,5 +1,5 @@
 CC=gcc
-CFLAGS=-Wall -Wextra -Wpedantic -std=gnu11 -g
+CFLAGS=-Wall -Wextra -Wpedantic -std=c11 -g
 
 tcp: tcp.c
 	$(CC) -o tcp tcp.c $(CFLAGS)

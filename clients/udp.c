@@ -1,21 +1,21 @@
 // A simple UDP client or server sporting some async features.
 
+#define _POSIX_C_SOURCE 200809L // 2008.09 needed for SA_RESETHAND and the S_IF* fd types
 #include <sys/socket.h> // socket(), struct sockaddr, ...
 #include <netinet/in.h> // struct inaddr_in{,6}, ...
 #include <arpa/inet.h> // inet_ntop()
 #include <netdb.h> // getaddrinfo() and struct addrinfo
 #include <sys/un.h> // support unix sockets in sockaddr2str()
-#include <sys/types.h>
-#include <sys/select.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <signal.h>
+#include <sys/select.h> // to avoid blocking on either stdin or the socket when the other has data
+#include <fcntl.h> // for making stdin nonblocking
+#include <sys/stat.h> // for checking which kind of file stdin is
+#include <signal.h> // for restoring stdin on Ctrl-C
 #include <errno.h>
 #include <string.h> // strlen() and strerror()
 #include <stdio.h>
 #include <stdlib.h> // exit() and strtoul()
 #include <unistd.h> // close() and read()
-#include <stdarg.h>
+#include <stdarg.h> // used by checkerr()
 #include <stdbool.h>
 
 int checkerr(int ret, char *desc, ...) {
@@ -35,7 +35,6 @@ int checkerr(int ret, char *desc, ...) {
 #define UNUSED(x) (void)(x)
 #define STDIN 0
 #define STDOUT 1
-#define LISTEN_BACKLOG 0
 
 in_port_t parseport(char *arg) {
     char *end;
@@ -71,11 +70,10 @@ char* sockaddr2str(struct sockaddr *sa) {
             // let inet_ntop handle the smart formatting of IPv6 addresses
             inet_ntop(AF_INET6, &(ipv6->sin6_addr), &ipstr[1], sizeof(ipstr)-1);
             size_t len = strlen(ipstr);
-            if (ipv6->sin6_scope_id == 0) {
-                snprintf(&ipstr[len], sizeof(ipstr)-len, "]:%d", ntohs(ipv6->sin6_port));
-            } else {
-                snprintf(&ipstr[len], sizeof(ipstr)-len, "%%%d]:%d", ipv6->sin6_scope_id, ntohs(ipv6->sin6_port));
+            if (ipv6->sin6_scope_id != 0) {
+                len += snprintf(&ipstr[len], sizeof(ipstr)-len, "%%%d", ipv6->sin6_scope_id);
             }
+            snprintf(&ipstr[len], sizeof(ipstr)-len, "]:%d", ntohs(ipv6->sin6_port));
         }
         return ipstr;
     } else if (sa->sa_family == AF_UNIX) {
@@ -84,8 +82,8 @@ char* sockaddr2str(struct sockaddr *sa) {
     } else if (sa->sa_family == AF_UNSPEC) {
         return "{unspecified}";
     } else {
-        fprintf(stderr, "Unknown address family (%d)\n", sa->sa_family);
-        exit(1);
+        snprintf(ipstr, sizeof(ipstr), "(address of unknown type %d)", sa->sa_family);
+        return ipstr;
     }
 }
 
@@ -93,14 +91,15 @@ char* sockaddr2str(struct sockaddr *sa) {
 char* local2str(int socket) {
     struct sockaddr_storage local;
     socklen_t len = sizeof(struct sockaddr_storage);
-    checkerr(getsockname(socket, (struct sockaddr*)&local, &len), "get local address of socket %d", socket);
+    checkerr(getsockname(socket, (struct sockaddr*)&local, &len),
+        "get local address of socket %d", socket);
     return sockaddr2str((struct sockaddr*)&local);
 }
 
 // resolve an address with getaddrinfo(), calling use() for each option
 void resolve(char *addr, char *port, bool(*use)(struct addrinfo*, void*), void *context) {
     struct addrinfo hints;
-    memset(&hints, 0, sizeof hints);
+    memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family = AF_UNSPEC; // both IPv4 and IPv6
     hints.ai_socktype = SOCK_DGRAM;
     struct addrinfo *ai;
@@ -123,7 +122,7 @@ void resolve(char *addr, char *port, bool(*use)(struct addrinfo*, void*), void *
     }
 }
 
-// creates a socket and binds it to ai->ai_addrlen
+// create a socket and bind it to ai->ai_addr
 bool try_bind(struct addrinfo *ai, void *param) {
     int *conn = (int*)param;
     fprintf(stderr, "Trying to bind to %s\n", sockaddr2str(ai->ai_addr));
@@ -146,31 +145,30 @@ bool try_bind(struct addrinfo *ai, void *param) {
     return true;
 }
 
-// create a socket and listen on the address
+// create a socket and bind to the address
 int bind_on(char *addr, char *port) {
     addr = addr==NULL ? "localhost" : addr;
     port = port==NULL ? "0" : port;
-    int sock;
+    int sock; // try_bind() always creates a new socket
     resolve(addr, port, try_bind, &sock);
     return sock;
 }
 
-// create a socket and listen on any interface at the given port
-// much simpler than listen_on()
+// create a socket and bind to all interfaces (both IPv6 and IPv4) at the given port
+// without the complexity of listen_on()
 int bind_any(char *port) {
     struct sockaddr_in6 any;
     memset(&any, 0, sizeof(struct sockaddr_in6));
     any.sin6_family = AF_INET6;
     any.sin6_port = port==NULL ? 0 : htons(parseport(port));
-    any.sin6_addr = in6addr_any; // not really necessary - it's already zero
+    any.sin6_addr = in6addr_any; // not really necessary; it's already zero
     int sock = checkerr(socket(any.sin6_family, SOCK_DGRAM, 0), "create UDP socket");
     checkerr(bind(sock, (struct sockaddr*)&any, sizeof(struct sockaddr_in6)),
-        "bind to %s", sockaddr2str((struct sockaddr*)&any)
-    );
+        "bind to %s", sockaddr2str((struct sockaddr*)&any));
     return sock;
 }
 
-// connects a socket to ai->ai_addr, creating a socket if it doesn't exists
+// connect a socket to ai->ai_addr, creating a socket if it doesn't exists
 bool try_connect(struct addrinfo *ai, void *params) {
     int *conn = (int*)params;
     bool new_socket = *conn == -1;
@@ -184,7 +182,7 @@ bool try_connect(struct addrinfo *ai, void *params) {
     }
     if (connect(*conn, ai->ai_addr, ai->ai_addrlen) == -1) {
         fprintf(stderr, "Cannot connect to %s", sockaddr2str(ai->ai_addr));
-        // split because socketaddr2str() reuses string buffer
+        // split because sockaddr2str() reuses string buffer
         fprintf(stderr, " (from %s): %s\n", local2str(*conn), strerror(errno));
         if (new_socket) {
             checkerr(close(*conn), "close the failed socket");
@@ -195,46 +193,46 @@ bool try_connect(struct addrinfo *ai, void *params) {
     return true;
 }
 
-// connect to domain:port, and bind to ip:port if one of them are not null
+// connect to domain:port, and bind to ip:port
 int connect_from_to(char *from_ip, char *from_port, char *to_domain, char *to_port) {
     from_port = from_port==NULL ? "0" : from_port;
     to_port = to_port==NULL ? "23" : to_port;
-    int conn;
+    int conn; // try_bind() always creates a new socket
     resolve(from_ip, from_port, try_bind, &conn);
     resolve(to_domain, to_port, try_connect, &conn);
     return conn;
 }
 
-// connect to domain:port, and bind to ip:port if one of them are not null
+// connect to domain:port without binding
 int connect_to(char *domain, char *port) {
     domain = domain==NULL ? "localhost" : domain;
     port = port==NULL ? "23" : port;
-    int conn = -1;
+    int conn = -1; // tells try_connect() to also create a socket
     resolve(domain, port, try_connect, &conn);
     return conn;
 }
 
-// much simpler
+// connect to the IPv4 loopback 127.0.0.1,
+// without the complexity of connect_to()
 int connect_to_localhost(char *port) {
     port = port==NULL ? "23" : port;
     struct sockaddr_in localhost;
-    bzero(&localhost, sizeof(struct sockaddr_in));
+    memset(&localhost, 0, sizeof(struct sockaddr_in));
     localhost.sin_family = AF_INET;
     localhost.sin_port = htons(parseport(port));
     localhost.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     int conn = checkerr(socket(AF_INET, SOCK_DGRAM, 0), "create UDP socket");
     checkerr(connect(conn, (struct sockaddr*)&localhost, sizeof(struct sockaddr_in)),
-             "connect to %s", sockaddr2str((struct sockaddr*)&localhost));
+        "connect to %s", sockaddr2str((struct sockaddr*)&localhost));
     return conn;
 }
 
+// connect() the socket to the first client, then call perform() and close() the socket afterwards
 void accept_one(int sd, ssize_t(*perform)(int, struct sockaddr_in6*, void*), void* param) {
     struct sockaddr_storage remote;
     socklen_t addrlen = sizeof(struct sockaddr_storage);
-    checkerr(
-        (int)recvfrom(sd, NULL, 0, MSG_PEEK, (struct sockaddr*)&remote, &addrlen),
-        "accept datagram"
-    );
+    checkerr((int)recvfrom(sd, NULL, 0, MSG_PEEK, (struct sockaddr*)&remote, &addrlen),
+        "accept datagram");
     char *client = sockaddr2str((struct sockaddr*)&remote);
     printf("Received packet from %s\n", client);
     checkerr(connect(sd, (struct sockaddr*)&remote, addrlen), "connect the socket");
@@ -247,6 +245,7 @@ void accept_one(int sd, ssize_t(*perform)(int, struct sockaddr_in6*, void*), voi
     checkerr(close(sd), "close socket connected to %s", client);
 }
 
+// call perform() then close() the socket
 void client(int sd, ssize_t(*perform)(int, struct sockaddr_in6*, void*), void* param) {
     fprintf(stderr, "Connected, from %s\n", local2str(sd));
     ssize_t lastret = perform(sd, NULL, param);
@@ -258,6 +257,7 @@ void client(int sd, ssize_t(*perform)(int, struct sockaddr_in6*, void*), void* p
     checkerr(close(sd), "close socket");
 }
 
+// echo any received packets
 void echo(int sd) {
     char buf[1024];
     struct sockaddr_storage remote;
@@ -274,11 +274,12 @@ void echo(int sd) {
     }
 }
 
+// used to restore nonblocking-ness on exit, see talk_rasync()
 int initial_stdin_flags; // is initialized by talk_rasync() before use
 
 void restore_stdin_flags() {
     fcntl(STDIN, F_SETFL, initial_stdin_flags);
-    // ignore errors - program is terminating already and printf() isn't signal-safe
+    // ignore any error; program is terminating already and printf() isn't signal-safe
 }
 
 void handler(int signal) {
@@ -286,7 +287,7 @@ void handler(int signal) {
     raise(signal); // continue to default handler (this handler was registered as oneshot)
 }
 
-/// send stdin to socket and socket to stdout, using select() to avoid blocking on either side.
+// send stdin to socket and socket to stdout, using select() to avoid blocking on either side.
 ssize_t talk_rasync(int conn, struct sockaddr_in6 *_remote, void *_param) {
     UNUSED(_remote);
     UNUSED(_param);
@@ -298,8 +299,9 @@ ssize_t talk_rasync(int conn, struct sockaddr_in6 *_remote, void *_param) {
     if ((stdinfo.st_mode & S_IFMT) != S_IFREG && (stdinfo.st_mode & S_IFMT) != S_IFBLK) {
         initial_stdin_flags = checkerr(fcntl(STDIN, F_GETFL, 0), "get flags for stdin");
         checkerr(fcntl(STDIN, F_SETFL, initial_stdin_flags | O_NONBLOCK), "make stdin nonblocking");
-        // restore blocking-ness on exit, because neither the shell nor `reset` does that.
-        // (not doing this breaks `git add -p` and other commands, `bash` can be used to restore.)
+        // restore blockingness on exit, otherwise `git add -p` and other commands stop working
+        // afterwards. (The `reset` command doesn't restore this either, but invoking `bash` then
+        // exiting fixes it).
         atexit(restore_stdin_flags);
         struct sigaction act;
         sigemptyset(&act.sa_mask);
