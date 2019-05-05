@@ -10,6 +10,9 @@ udp: udp.c
 udplite: udplite.c
 	$(CC) -o udplite udplite.c $(CFLAGS)
 
+dccp: dccp.c
+	$(CC) -o dccp dccp.c $(CFLAGS)
+
 time32: time32.rs
 	rustc -o time32 time32.rs
 
