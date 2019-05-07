@@ -18,3 +18,6 @@ time32: time32.rs
 
 mq: mq.c
 	$(CC) -o mq mq.c -lrt $(CFLAGS)
+
+unix_stream: unix_stream.c
+	$(CC) -o unix_stream unix_stream.c $(CFLAGS)
