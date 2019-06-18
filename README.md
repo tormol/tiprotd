@@ -5,17 +5,17 @@ It is written in Rust, using the low-level async library `mio`.
 
 ## Implemented protocols
 
-* echo (TCP and UDP port 7)
-* discard (TCP and UDP port 9)
-* QOTD (TCP and UDP port 17)
-* time (TCP and UDP port 37)
+* echo (TCP and UDP port 7, unix stream and datagram socket)
+* discard (TCP and UDP port 9, unix stream and datagram socket, posix message queue)
+* QOTD (TCP and UDP port 17, unix stream and datagram socket)
+* time (TCP and UDP port 37, unix stream and datagram socket)
 
 To prevent being used for UDP amplification DDoS attacks, UDP replies are
 limited to 1 MiB per IPv4 address or IPv6 /64 network within a 10 minute window.
 
 I plan to also implement at least daytime (port 13) and TCPMUX (port 1),
-and want to also support the transport layer protocols SCTP, DCCP and UDPlite
-as well as unix domain sockets (including SOCK_SEQPACKET)
+and want to also support the transport layer protocols SCTP, DCCP, UDPlite,
+and unix SOCK_SEQPACKET.
 
 ## Invocation
 

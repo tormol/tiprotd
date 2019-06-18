@@ -1,13 +1,14 @@
 [package]
 name = "tiprotd"
 description = "A mio-based implementation of several trivial and abadoned network protocols, with a twist"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Torbjørn Birch Moltu <t.b.moltu@lyse.net>"]
 license = "AGPL-3.0-or-later"
 edition = "2018"
 
 [dependencies]
 mio = "0.6"
+mio-uds = "0.6.7"
 slab = "0.4"
 chrono = "0.4"
 
