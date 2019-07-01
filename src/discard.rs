@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::fmt::Debug;
 use std::net::Shutdown;
 use std::io::{ErrorKind, Read, Write, stdout};
@@ -7,8 +6,6 @@ use mio::{Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
-#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-use posixmq::PosixMq;
 
 use crate::Server;
 use crate::ServiceSocket;
@@ -31,7 +28,7 @@ pub enum DiscardSocket {
     //#[cfg(unix)]
     //Pipe(Pipe)
     #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-    PosixMq(PosixMq),
+    PosixMq(PosixMqWrapper),
 }
 
 use self::DiscardSocket::*;
@@ -46,31 +43,6 @@ fn anti_discard(from: &dyn Debug,  protocol: &str,  bytes: &[u8]) {
     if bytes.last().cloned() != Some(b'\n') {
         println!();
     }
-}
-
-#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-fn setup_mq_discard(server: &mut Server) {
-    let res = posixmq::OpenOptions::readonly()
-        .permissions(0o622)
-        .create()
-        .max_msg_len(8192)
-        .capacity(2)
-        .nonblocking()
-        .open("/discard");
-    let mq = match res {
-        Ok(mq) => mq,
-        Err(e) => {
-            eprintln!("Cannot open posix message queue /discard: {}", e.description());
-            return;
-        }
-    };
-    let entry = server.sockets.vacant_entry();
-    let res = server.poll.register(&mq, Token(entry.key()), Ready::readable(), mio::PollOpt::edge());
-    if let Err(e) = res {
-        eprintln!("Cannot register posix message queue: {}, skipping", e);
-        return;
-    }
-    entry.insert(ServiceSocket::Discard(PosixMq(mq)));
 }
 
 impl DiscardSocket {
@@ -90,7 +62,13 @@ impl DiscardSocket {
             &mut|socket, Token(_)| ServiceSocket::Discard(UnixDatagram(socket))
         );
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-        setup_mq_discard(server);
+        server.setup_mq("discard", Ready::readable(),
+            posixmq::OpenOptions::readonly()
+                .permissions(0o622)
+                .max_msg_len(server.buffer.len())
+                .capacity(2),
+            &mut|mq, Token(_)| ServiceSocket::Discard(PosixMq(mq))
+        );
     }
 
     pub fn ready(&mut self,  _: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
@@ -170,7 +148,7 @@ impl DiscardSocket {
                     match mq.receive(&mut server.buffer) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break Drained,
                         Err(e) => {
-                            eprintln!("Error receiving posix message: {}", e);
+                            eprintln!("Error receiving from posix message queue /discard: {}, removing it.", e);
                             break Remove;
                         },
                         Ok((_priority, len)) => anti_discard(&"/discard", "mq", &server.buffer[..len]),

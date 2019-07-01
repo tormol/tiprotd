@@ -185,6 +185,30 @@ impl Server {
         }
     }
 
+    #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+    fn setup_mq(&mut self,  service_name: &'static str,  poll_for: Ready,
+            options: &mut posixmq::OpenOptions,
+            encapsulate: &mut dyn FnMut(PosixMqWrapper, Token)->ServiceSocket
+    ) {
+        match options.create().nonblocking().open(service_name) {
+            Ok(mq) => {
+                let entry = self.sockets.vacant_entry();
+                let token = Token(entry.key());
+                let res = self.poll.register(&mq, token, poll_for, mio::PollOpt::edge());
+                if let Err(e) = res {
+                    eprintln!("Cannot register posix message queue /{} with mio: {}, skipping",
+                        service_name, e
+                    );
+                } else {
+                    entry.insert(encapsulate(PosixMqWrapper(mq, service_name), token));
+                }
+            }
+            Err(e) => {
+                eprintln!("Cannot open posix message queue /{}: {}", service_name, e);
+            }
+        }
+    }
+
     fn listen_tcp(&mut self,  port: u16,  service_name: &'static str,
             encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
     ) {

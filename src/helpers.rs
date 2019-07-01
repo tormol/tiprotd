@@ -206,6 +206,24 @@ impl Drop for DeleteOnDrop {
     }
 }
 
+#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+pub struct PosixMqWrapper(pub posixmq::PosixMq, pub &'static str);
+#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+impl Deref for PosixMqWrapper {
+    type Target = posixmq::PosixMq;
+    fn deref(&self) -> &posixmq::PosixMq {
+        &self.0
+    }
+}
+#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+impl Drop for PosixMqWrapper {
+    fn drop(&mut self) {
+        if let Err(e) = posixmq::unlink(self.1) {
+            eprintln!("Error removing posix message queue /{}: {}", self.1, e);
+        }
+    }
+}
+
 
 #[cfg(unix)]
 pub fn unix_stream_accept_loop<

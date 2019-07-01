@@ -150,7 +150,8 @@ pub enum QotdSocket {
     UnixStreamConn(UnixStreamWrapper, u32),
     #[cfg(unix)]
     UnixDatagram(UnixDatagram, Vec<UnixSocketAddr>), // doesn't implement Hash
-    // TODO PosixMq send-if-not-full
+    #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+    PosixMq(PosixMqWrapper),
 }
 
 impl QotdSocket {
@@ -169,6 +170,11 @@ impl QotdSocket {
         server.listen_unix_datagram(Ready::readable() | Ready::writable(), "qotd", &mut|socket, _| {
             ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, Vec::new()))
         });
+        #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+        server.setup_mq("qotd", Ready::writable(),
+            posixmq::OpenOptions::writeonly().permissions(0o644).max_msg_len(QOTD.len()).capacity(1),
+            &mut|mq, Token(_)| ServiceSocket::Qotd(QotdSocket::PosixMq(mq))
+        );
     }
 
     pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
@@ -217,6 +223,19 @@ impl QotdSocket {
             #[cfg(unix)]
             &mut QotdSocket::UnixDatagram(ref socket, ref mut outstanding) => {
                 unix_datagram_short(socket, outstanding, readiness, QOTD, "qotd")
+            }
+            #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+            &mut QotdSocket::PosixMq(ref mq) => {
+                loop {
+                    match mq.send(0, QOTD) {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break Drained,
+                        Err(e) => {
+                            eprintln!("Error sending to posix message queue /qotd: {}, removing it.", e);
+                            break Remove;
+                        }
+                        Ok(()) => {}
+                    }
+                }
             }
         }
     }
