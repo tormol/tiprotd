@@ -20,11 +20,11 @@ pub enum DiscardSocket {
     TcpConn(TcpStreamWrapper),
     Udp(UdpSocket),
     #[cfg(unix)]
-    UnixStreamListener(UnixListener),
+    UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixStreamConn(UnixStreamWrapper),
     #[cfg(unix)]
-    UnixDatagram(UnixDatagram),
+    UnixDatagram(UnixSocketWrapper<UnixDatagram>),
     //#[cfg(unix)]
     //Pipe(Pipe)
     #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
@@ -54,12 +54,12 @@ impl DiscardSocket {
             &mut|socket, Token(_)| ServiceSocket::Discard(Udp(socket))
         );
         #[cfg(unix)]
-        server.listen_unix_stream("discard",
-            &mut|listener, Token(_)| ServiceSocket::Discard(UnixStreamListener(listener))
+        UnixSocketWrapper::create_stream_listener("discard", server,
+            |listener| ServiceSocket::Discard(UnixStreamListener(listener))
         );
         #[cfg(unix)]
-        server.listen_unix_datagram(Ready::readable(), "discard",
-            &mut|socket, Token(_)| ServiceSocket::Discard(UnixDatagram(socket))
+        UnixSocketWrapper::create_datagram_socket("discard", Ready::readable(), server,
+            |socket| ServiceSocket::Discard(UnixDatagram(socket))
         );
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
         server.setup_mq("discard", Ready::readable(),
@@ -155,6 +155,22 @@ impl DiscardSocket {
                     }
                 }
             }
+        }
+    }
+
+    pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
+        match self {
+            &TcpListener(ref listener) => Some(listener),
+            &Udp(ref socket) => Some(socket),
+            &TcpConn(ref conn) => Some(&**conn),
+            #[cfg(unix)]
+            &UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(unix)]
+            &UnixDatagram(ref socket) => Some(&**socket),
+            #[cfg(unix)]
+            &UnixStreamConn(ref conn) => Some(&**conn),
+            #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+            &PosixMq(ref mq) => Some(&**mq),
         }
     }
 }

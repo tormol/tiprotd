@@ -22,6 +22,8 @@ extern crate mio;
 extern crate mio_uds;
 #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
 extern crate posixmq;
+#[cfg(unix)]
+extern crate nix;
 
 mod assigned_addr;
 mod client_limiter;
@@ -31,6 +33,7 @@ use helpers::*;
 mod discard;
 mod echo;
 mod shortsend;
+mod signal;
 
 use std::error::Error;
 use std::io::{self, ErrorKind};
@@ -40,7 +43,6 @@ use std::time::Duration;
 
 use mio::{Token, Poll, PollOpt, Ready, Events};
 use mio::net::{TcpListener, UdpSocket};
-use mio_uds::{UnixListener, UnixStream, UnixDatagram};
 use slab::Slab;
 
 
@@ -56,6 +58,8 @@ const UDP_SEND_LIMIT: u32 = 1*1024*1024;
 const RESOURCE_LIMIT: u32 = 500*1024;
 
 pub enum ServiceSocket {
+    #[cfg(unix)]
+    SignalReceiver(signal::SignalReceiver),
     Discard(discard::DiscardSocket),
     Echo(echo::EchoSocket),
     Qotd(shortsend::QotdSocket),
@@ -68,6 +72,8 @@ impl ServiceSocket {
         echo::EchoSocket::setup(server);
         shortsend::QotdSocket::setup(server);
         shortsend::Time32Socket::setup(server);
+        #[cfg(unix)]
+        signal::SignalReceiver::setup(server);
     }
     fn ready(&mut self,  readiness: Ready,  this_token: Token,  server: &mut Server)
     -> helpers::EntryStatus {
@@ -76,9 +82,22 @@ impl ServiceSocket {
             ServiceSocket::Echo(echo) => echo.ready(readiness, this_token, server),
             ServiceSocket::Qotd(qotd) => qotd.ready(readiness, this_token, server),
             ServiceSocket::Time32(time32) => time32.ready(readiness, this_token, server),
+            #[cfg(unix)]
+            ServiceSocket::SignalReceiver(sr) => sr.ready(readiness, this_token, server),
             ServiceSocket::CurrentlyMoved => {
                 unreachable!("CurrentlyMoved at {} not replaced or removed", this_token.0)
             }
+        }
+    }
+    pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
+        match self {
+            ServiceSocket::Discard(discard) => discard.inner_descriptor(),
+            ServiceSocket::Echo(echo) => echo.inner_descriptor(),
+            ServiceSocket::Qotd(qotd) => qotd.inner_descriptor(),
+            ServiceSocket::Time32(time32) => time32.inner_descriptor(),
+            #[cfg(unix)]
+            ServiceSocket::SignalReceiver(sr) => sr.inner_descriptor(),
+            ServiceSocket::CurrentlyMoved => None
         }
     }
 }
@@ -89,6 +108,7 @@ pub struct Server {
     sockets: Slab<ServiceSocket>,
     limits: ClientLimiter,
     buffer: [u8; 4096],
+    internally_shutdown: u32,
     port_offset: Option<u16>,
     #[cfg(unix)]
     path_base: &'static str,
@@ -100,6 +120,7 @@ impl Server {
             sockets: Slab::with_capacity(64),
             limits: ClientLimiter::new(LIMITS_DURATION, UDP_SEND_LIMIT, RESOURCE_LIMIT),
             buffer: [0; 4096],
+            internally_shutdown: 0,
             port_offset: None,
             #[cfg(unix)]
             path_base: "/var/run/",
@@ -127,59 +148,6 @@ impl Server {
                 eprintln!("Cannot listen on {}://{}:{} (for {}): {}",
                     protocol_name, on, port, service_name, e.description()
                 );
-                None
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn try_bind_unix<S: mio::Evented>(&mut self,
-            service_name: &str,  protocol_name: &str,
-            poll_for: Ready,  binder: fn(&str)->io::Result<S>,
-    ) -> Option<(S, slab::VacantEntry<ServiceSocket>)> {
-        let on = format!("{}{}.{}_socket", self.path_base, service_name, protocol_name);
-        match binder(&on) {
-            Ok(socket) => {
-                let entry = self.sockets.vacant_entry();
-                self.poll.register(&socket, Token(entry.key()), poll_for, PollOpt::edge())
-                    .expect(&format!("Cannot register {} listener", protocol_name));
-                Some((socket, entry))
-            }
-            Err(ref e) if e.kind() == ErrorKind::PermissionDenied
-            && self.path_base.starts_with("/") => {
-                eprintln!("Doesn't have permission to create socket in {}, trying current directory instead",
-                    self.path_base
-                );
-                self.path_base = "";
-                self.try_bind_unix(service_name, protocol_name, poll_for, binder)
-            }
-            Err(ref e) if e.kind() == ErrorKind::AddrInUse => {
-                // try to connect to see if it's stale, then remove it and try again if it is
-                match UnixStream::connect(&on) {
-                    Err(ref e) if e.kind() == ErrorKind::ConnectionRefused
-                    || e.kind() == ErrorKind::NotFound => {
-                        // stale or not a socket
-                        // TODO test if path is a socket first
-                        match std::fs::remove_file(&on) {
-                            Err(ref e) if e.kind() != ErrorKind::NotFound => {
-                                eprintln!("Cannot remove stale socket {:?}: {}", on, e);
-                                None
-                            }
-                            _ => {
-                                eprintln!("Removed stale socket {:?}", on);
-                                // try again
-                                self.try_bind_unix(service_name, protocol_name, poll_for, binder)
-                            }
-                        }
-                    },
-                    _ => {
-                        eprintln!("socket {:?} already exists, another instance might already be running", on);
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Cannot listen on {}: {}", on, e.description());
                 None
             }
         }
@@ -233,36 +201,6 @@ impl Server {
         entry.insert(encapsulate(socket, token));
     }
 
-    #[cfg(unix)]
-    fn listen_unix_stream(&mut self,  service_name: &'static str,
-            encapsulate: &mut dyn FnMut(UnixListener, Token)->ServiceSocket
-    ) {
-        let res = self.try_bind_unix(service_name, "stream", Ready::readable(),
-            |path| UnixListener::bind(path)
-        );
-        if let Some((listener, entry)) = res {
-            let token = Token(entry.key()); // make borrowck happy
-            entry.insert(encapsulate(listener, token));
-        } else {
-            std::process::exit(1);
-        }
-    }
-
-    #[cfg(unix)]
-    fn listen_unix_datagram(&mut self,  poll_for: Ready,  service_name: &'static str,
-            encapsulate: &mut dyn FnMut(UnixDatagram, Token)->ServiceSocket
-    ) {
-        let res = self.try_bind_unix(service_name, "dgram", poll_for,
-            |path| UnixDatagram::bind(path)
-        );
-        if let Some((socket, entry)) = res {
-            let token = Token(entry.key()); // make borrowck happy
-            entry.insert(encapsulate(socket, token));
-        } else {
-            std::process::exit(1);
-        }
-    }
-
     fn trigger(&mut self,  readiness: Ready,  mut socket: ServiceSocket,  token: Token) {
         match socket.ready(readiness, token, self) {
             Drained => {
@@ -287,13 +225,15 @@ fn main() {
     ServiceSocket::setup(&mut server);
 
     let mut events = Events::with_capacity(1024);
-    while server.sockets.len() > 0 {
+    while server.sockets.len() > server.internally_shutdown as usize {
         server.poll.poll(&mut events, None).expect("Cannot poll selector");
         //println!("connections: {}, events: {}", server.sockets.len(), events.iter().count());
         for event in events.iter() {
             let entry = match server.sockets.get_mut(event.token().0) {
                 Some(entry) => mem::replace(entry, ServiceSocket::CurrentlyMoved),
                 None => {
+                    // can happen if multiple events for the same token and
+                    // handling the first one causes the entry to be removed
                     eprintln!("Unknown mio token: {}", event.token().0);
                     continue;
                 }
@@ -305,5 +245,6 @@ fn main() {
             // TODO compactreregister
             server.sockets.shrink_to_fit();
         }
+        println!("entries: {}", server.sockets.len());
     }
 }

@@ -21,11 +21,11 @@ pub enum EchoSocket {
     TcpConn(TcpStreamWrapper, VecDeque<u8>, bool),
     Udp(UdpSocket, VecDeque<(SocketAddr,Rc<[u8]>)>),
     #[cfg(unix)]
-    UnixStreamListener(UnixListener),
+    UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixStreamConn(UnixStreamWrapper, VecDeque<u8>, bool),
     #[cfg(unix)]
-    UnixDatagram(UnixDatagram, VecDeque<(UnixSocketAddr,Rc<[u8]>)>),
+    UnixDatagram(UnixSocketWrapper<UnixDatagram>, VecDeque<(UnixSocketAddr,Rc<[u8]>)>),
 }
 
 fn tcp_echo(conn: &mut TcpStreamWrapper,  unsent: &mut VecDeque<u8>,  recv_shutdown: &mut bool,
@@ -155,12 +155,12 @@ impl EchoSocket {
             &mut|socket, Token(_)| ServiceSocket::Echo(Udp(socket, VecDeque::new()))
         );
         #[cfg(unix)]
-        server.listen_unix_stream("echo",
-            &mut|listener, Token(_)| ServiceSocket::Echo(UnixStreamListener(listener))
+        UnixSocketWrapper::create_stream_listener("echo", server,
+            |listener| ServiceSocket::Echo(UnixStreamListener(listener))
         );
         #[cfg(unix)]
-        server.listen_unix_datagram(Ready::readable() | Ready::writable(), "echo",
-            &mut|socket, Token(_)| ServiceSocket::Echo(UnixDatagram(socket, VecDeque::new()))
+        UnixSocketWrapper::create_datagram_socket("echo", Ready::all(), server,
+            |socket| ServiceSocket::Echo(UnixDatagram(socket, VecDeque::new()))
         );
     }
 
@@ -255,6 +255,20 @@ impl EchoSocket {
             &mut UnixStreamConn(ref mut conn, ref mut unsent, ref mut read_shutdown) => {
                 unix_stream_echo(conn, unsent, read_shutdown, &mut server.buffer, readiness)
             }
+        }
+    }
+
+    pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
+        match self {
+            &TcpListener(ref listener) => Some(listener),
+            &Udp(ref socket, _) => Some(socket),
+            &TcpConn(ref conn, _, _) => Some(&**conn),
+            #[cfg(unix)]
+            &UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(unix)]
+            &UnixDatagram(ref socket, _) => Some(&**socket),
+            #[cfg(unix)]
+            &UnixStreamConn(ref conn, _, _) => Some(&**conn),
         }
     }
 }

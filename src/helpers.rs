@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::error::Error;
 use std::fmt::Display;
 use std::io::{self, ErrorKind};
@@ -20,11 +21,19 @@ use crate::ServiceSocket;
 use crate::Server;
 
 #[cfg(unix)]
-pub trait Descriptor: AsRawFd + Evented {}
+pub trait Descriptor: AsRawFd + Evented + Any+'static {
+    fn as_any(&self) -> &(dyn Any+'static);
+}
 #[cfg(unix)]
-impl<T: AsRawFd+Evented> Descriptor for T {}
+impl<T: AsRawFd+Evented+Any+Sized> Descriptor for T {
+    fn as_any(&self) -> &(dyn Any+'static) {
+        self
+    }
+}
 #[cfg(not(unix))]
-pub use Evented as Descriptor;
+pub trait Descriptor: Evented + Any {}
+#[cfg(not(unix))]
+impl<T: Evented+Any> Descriptor for T {}
 // pub enum Socket<'a> {
 //     TcpStream(&'a TcpStream),
 //     TcpListener(&'a TcpListener),
@@ -195,13 +204,97 @@ impl TcpStreamWrapper {
     }
 }
 
+/// also for listeners, deletes on drop if named
 #[cfg(unix)]
-pub struct DeleteOnDrop(Box<str>);
+pub struct UnixSocketWrapper<S: Descriptor>(pub S, pub Box<str>);
 #[cfg(unix)]
-impl Drop for DeleteOnDrop {
+impl<S: Descriptor> UnixSocketWrapper<S> {
+    fn create(on: String,  server: &mut Server,  binder: fn(&str)->Result<S,io::Error>)
+    -> Option<Self> {
+        match binder(&on) {
+            Ok(socket) => Some(UnixSocketWrapper(socket, on.into_boxed_str())),
+            Err(ref e) if e.kind() == ErrorKind::PermissionDenied
+            && server.path_base.starts_with("/") => {
+                eprintln!("Doesn't have permission to create unix socket in {}, trying current directory instead",
+                    server.path_base
+                );
+                server.path_base = "";
+                Self::create(on, server, binder)
+            }
+            Err(ref e) if e.kind() == ErrorKind::AddrInUse => {
+                // try to connect to see if it's stale, then remove it and try again if it is
+                match UnixStream::connect(&on) {
+                    Err(ref e) if e.kind() == ErrorKind::ConnectionRefused
+                    || e.kind() == ErrorKind::NotFound => {
+                        // stale or not a socket
+                        // TODO test if path is a socket first
+                        match std::fs::remove_file(&on) {
+                            Err(ref e) if e.kind() != ErrorKind::NotFound => {
+                                eprintln!("Cannot remove stale socket {:?}: {}", on, e);
+                                None
+                            }
+                            _ => {
+                                eprintln!("Removed stale socket {:?}", on);
+                                // try again
+                                Self::create(on, server, binder)
+                            }
+                        }
+                    },
+                    _ => {
+                        eprintln!("socket {:?} already exists, another instance might already be running", on);
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Cannot listen on {}: {}", on, e.description());
+                None
+            }
+        }
+    }
+}
+#[cfg(unix)]
+impl UnixSocketWrapper<UnixListener> {
+    pub fn create_stream_listener(service_name: &str,  server: &mut Server,
+            encapsulate: fn(Self)->ServiceSocket
+    ) {
+        let on = format!("{}.socket", service_name);
+        if let Some(socket) = Self::create(on, server, |path| UnixListener::bind(path) ) {
+            let entry = server.sockets.vacant_entry();
+            server.poll.register(&*socket, Token(entry.key()), Ready::readable(), PollOpt::edge())
+                        .expect("Cannot register unix stream listener");
+            entry.insert(encapsulate(socket));
+        }
+    }
+}
+#[cfg(unix)]
+impl UnixSocketWrapper<UnixDatagram> {
+    pub fn create_datagram_socket(service_name: &str,  poll_for: Ready,
+            server: &mut Server,  encapsulate: fn(Self)->ServiceSocket
+    ) {
+        let on = format!("{}_dgram.socket", service_name);
+        if let Some(socket) = Self::create(on, server, |path| UnixDatagram::bind(path) ) {
+            let entry = server.sockets.vacant_entry();
+            server.poll.register(&*socket, Token(entry.key()), poll_for, PollOpt::edge())
+                        .expect("Cannot register unix datagram socket");
+            entry.insert(encapsulate(socket));
+        }
+    }
+}
+#[cfg(unix)]
+impl<S: Descriptor> Deref for UnixSocketWrapper<S> {
+    type Target = S;
+    fn deref(&self) -> &S {
+        &self.0
+    }
+}
+#[cfg(unix)]
+impl<S: Descriptor> Drop for UnixSocketWrapper<S> {
     fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_file(self.0.as_ref()) {
-            eprintln!("Couldn't delete {}: {}", self.0, err);
+        if !self.1.starts_with('\0') {
+            if let Err(err) = std::fs::remove_file(self.1.as_ref()) {
+                eprintln!("Couldn't delete {}: {}", self.1, err);
+            }
         }
     }
 }

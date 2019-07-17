@@ -145,11 +145,11 @@ pub enum QotdSocket {
     TcpConn(TcpStreamWrapper, u32),
     Udp(UdpSocket, HashSet<SocketAddr>),
     #[cfg(unix)]
-    UnixStreamListener(UnixListener),
+    UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixStreamConn(UnixStreamWrapper, u32),
     #[cfg(unix)]
-    UnixDatagram(UnixDatagram, Vec<UnixSocketAddr>), // doesn't implement Hash
+    UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>), // doesn't implement Hash
     #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
     PosixMq(PosixMqWrapper),
 }
@@ -163,13 +163,13 @@ impl QotdSocket {
             &mut|socket, Token(_)| ServiceSocket::Qotd(QotdSocket::Udp(socket, HashSet::new()))
         );
         #[cfg(unix)]
-        server.listen_unix_stream("qotd", &mut|listener, Token(_)| {
-            ServiceSocket::Qotd(QotdSocket::UnixStreamListener(listener))
-        });
+        UnixSocketWrapper::create_stream_listener("qotd", server,
+            |listener| ServiceSocket::Qotd(QotdSocket::UnixStreamListener(listener))
+        );
         #[cfg(unix)]
-        server.listen_unix_datagram(Ready::readable() | Ready::writable(), "qotd", &mut|socket, _| {
-            ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, Vec::new()))
-        });
+        UnixSocketWrapper::create_datagram_socket("qotd", Ready::all(), server,
+            |socket| ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, Vec::new()))
+        );
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
         server.setup_mq("qotd", Ready::writable(),
             posixmq::OpenOptions::writeonly().mode(0o644).max_msg_len(QOTD.len()).capacity(1),
@@ -239,6 +239,22 @@ impl QotdSocket {
             }
         }
     }
+
+    pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
+        match self {
+            &QotdSocket::TcpListener(ref listener) => Some(listener),
+            &QotdSocket::Udp(ref socket, _) => Some(socket),
+            &QotdSocket::TcpConn(ref conn, _) => Some(&**conn),
+            #[cfg(unix)]
+            &QotdSocket::UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(unix)]
+            &QotdSocket::UnixDatagram(ref socket, _) => Some(&**socket),
+            #[cfg(unix)]
+            &QotdSocket::UnixStreamConn(ref conn, _) => Some(&**conn),
+            #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+            &QotdSocket::PosixMq(ref mq) => Some(&**mq),
+        }
+    }
 }
 
 
@@ -249,11 +265,11 @@ pub enum Time32Socket {
     TcpConn(TcpStreamWrapper),
     Udp(UdpSocket, HashSet<SocketAddr>),
     #[cfg(unix)]
-    UnixStreamListener(UnixListener),
+    UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixStreamConn(UnixStreamWrapper),
     #[cfg(unix)]
-    UnixDatagram(UnixDatagram, Vec<UnixSocketAddr>),
+    UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>),
 }
 
 fn new_time32() -> [u8;4] {
@@ -294,13 +310,13 @@ impl Time32Socket {
             &mut|socket, Token(_)| ServiceSocket::Time32(Time32Socket::Udp(socket, HashSet::new()))
         );
         #[cfg(unix)]
-        server.listen_unix_stream("time32", &mut|listener, Token(_)| {
-            ServiceSocket::Time32(Time32Socket::UnixStreamListener(listener))
-        });
+        UnixSocketWrapper::create_stream_listener("time32", server,
+            |listener| ServiceSocket::Time32(Time32Socket::UnixStreamListener(listener))
+        );
         #[cfg(unix)]
-        server.listen_unix_datagram(Ready::readable() | Ready::writable(), "time32", &mut|socket, _| {
-            ServiceSocket::Time32(Time32Socket::UnixDatagram(socket, Vec::new()))
-        });
+        UnixSocketWrapper::create_datagram_socket("time32", Ready::all(), server,
+            |socket| ServiceSocket::Time32(Time32Socket::UnixDatagram(socket, Vec::new()))
+        );
     }
 
     pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
@@ -345,6 +361,20 @@ impl Time32Socket {
             &mut Time32Socket::UnixDatagram(ref socket, ref mut outstanding) => {
                 unix_datagram_short(socket, outstanding, readiness, &sometime, "time32")
             }
+        }
+    }
+
+    pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
+        match self {
+            &Time32Socket::TcpListener(ref listener) => Some(listener),
+            &Time32Socket::Udp(ref socket, _) => Some(socket),
+            &Time32Socket::TcpConn(ref conn) => Some(&**conn),
+            #[cfg(unix)]
+            &Time32Socket::UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(unix)]
+            &Time32Socket::UnixDatagram(ref socket, _) => Some(&**socket),
+            #[cfg(unix)]
+            &Time32Socket::UnixStreamConn(ref conn) => Some(&**conn),
         }
     }
 }
