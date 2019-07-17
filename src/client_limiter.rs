@@ -187,6 +187,7 @@ impl ClientLimiter {
         }
     }
 
+    #[allow(unused)]
     pub fn request_resources(&mut self,  addr: SocketAddr,  add: usize) -> bool {
         match self.register(addr) {
             Ok(stats) => stats.request_resources(add),
@@ -195,6 +196,7 @@ impl ClientLimiter {
         }
     }
 
+    #[allow(unused)]
     pub fn release_resources(&mut self,  addr: SocketAddr,  sub: usize) {
         match self.register(addr) {
             Ok(stats) => stats.release_resources(sub),
