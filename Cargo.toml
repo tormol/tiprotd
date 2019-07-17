@@ -13,4 +13,4 @@ slab = "0.4"
 chrono = "0.4"
 
 [target.'cfg(target_os="linux")'.dependencies]
-posixmq = {version="0.1", features=["mio"]}
+posixmq = {version="0.2", features=["mio"]}

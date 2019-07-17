@@ -172,7 +172,7 @@ impl QotdSocket {
         });
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
         server.setup_mq("qotd", Ready::writable(),
-            posixmq::OpenOptions::writeonly().permissions(0o644).max_msg_len(QOTD.len()).capacity(1),
+            posixmq::OpenOptions::writeonly().mode(0o644).max_msg_len(QOTD.len()).capacity(1),
             &mut|mq, Token(_)| ServiceSocket::Qotd(QotdSocket::PosixMq(mq))
         );
     }

@@ -64,7 +64,7 @@ impl DiscardSocket {
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
         server.setup_mq("discard", Ready::readable(),
             posixmq::OpenOptions::readonly()
-                .permissions(0o622)
+                .mode(0o622)
                 .max_msg_len(server.buffer.len())
                 .capacity(2),
             &mut|mq, Token(_)| ServiceSocket::Discard(PosixMq(mq))
