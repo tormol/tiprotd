@@ -102,6 +102,18 @@ impl ServiceSocket {
     }
 }
 
+/// Convert a nix result to a std::io result.
+///
+/// It maps nix::Error::Sys to std::io::Error::last_os_error() (because nix's
+/// Errno is lossy) and panics on any nix invented error.
+#[cfg(unix)]
+fn nixe<T>(nix_result: Result<T, nix::Error>) -> Result<T, io::Error> {
+    match nix_result {
+        Ok(success) => Ok(success),
+        Err(nix::Error::Sys(_)) => Err(io::Error::last_os_error()),
+        Err(nix_invented) => panic!("nix caused error: {}", nix_invented)
+    }
+}
 
 pub struct Server {
     poll: Poll,
@@ -145,8 +157,8 @@ impl Server {
                 self.try_bind_ip(port, protocol_name, service_name, poll_for, binder)
             }
             Err(e) => {
-                eprintln!("Cannot listen on {}://{}:{} (for {}): {}",
-                    protocol_name, on, port, service_name, e.description()
+                eprintln!("Cannot listen on {}://{} (for {}): {}",
+                    protocol_name, on, service_name, e.description()
                 );
                 None
             }
@@ -180,8 +192,49 @@ impl Server {
     fn listen_tcp(&mut self,  port: u16,  service_name: &'static str,
             encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
     ) {
-        let res = self.try_bind_ip(port, service_name, "tcp", Ready::readable(),
+        #[cfg(not(unix))]
+        let res = self.try_bind_ip(port, "tcp", service_name, Ready::readable(),
             |addr| TcpListener::bind(&addr)
+        );
+        #[cfg(unix)]
+        let res = self.try_bind_ip(port, "tcp", service_name, Ready::readable(),
+            |addr| {
+                use std::os::unix::io::FromRawFd;
+                use nix::sys::socket::{self, AddressFamily, SockType, SockFlag};
+                use nix::sys::socket::{getsockopt, setsockopt, sockopt::*};
+                let family = match addr {
+                    SocketAddr::V6(_) => AddressFamily::Inet6,
+                    SocketAddr::V4(_) => AddressFamily::Inet,
+                };
+                let options = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+                let listener = nixe(socket::socket(family, SockType::Stream, options, None))?;
+                let nix_addr = socket::SockAddr::Inet(socket::InetAddr::from_std(&addr));
+                if let Err(e) = nixe(socket::bind(listener, &nix_addr)) {
+                    let _ = nix::unistd::close(listener);
+                    return Err(e);
+                }
+                if let Ok(default_size) = getsockopt(listener, RcvBuf) {
+                    println!("tcp receive buffer size is {}", default_size);
+                }
+                if let Err(e) = setsockopt(listener, RcvBuf, &0) {
+                    eprintln!("Cannot set tcp receive buffer size: {}", e);
+                } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
+                    println!("Set tcp receive buffer size to {}", set_size);
+                }
+                if let Ok(default_size) = getsockopt(listener, SndBuf) {
+                    println!("tcp send buffer size is {}", default_size);
+                }
+                if let Err(e) = setsockopt(listener, SndBuf, &0) {
+                    eprintln!("Cannot set tcp send buffer size: {}", e);
+                } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
+                    println!("Set tcp send buffer size to {}", set_size);
+                }
+                if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
+                    let _ = nix::unistd::close(listener);
+                    return Err(e);
+                }
+                unsafe { Ok(TcpListener::from_raw_fd(listener)) }
+            }
         );
         if let Some((listener, entry)) = res {
             let token = Token(entry.key()); // make borrowck happy
@@ -245,6 +298,6 @@ fn main() {
             // TODO compactreregister
             server.sockets.shrink_to_fit();
         }
-        println!("entries: {}", server.sockets.len());
+        // println!("entries: {}", server.sockets.len());
     }
 }
