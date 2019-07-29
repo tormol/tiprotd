@@ -208,6 +208,11 @@ impl Server {
                 };
                 let options = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
                 let listener = nixe(socket::socket(family, SockType::Stream, options, None))?;
+                if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
+                    eprintln!("Connot set SO_REUSEADDR for tcp://{}: {}, continuing anyway",
+                        addr, e
+                    );
+                }
                 let nix_addr = socket::SockAddr::Inet(socket::InetAddr::from_std(&addr));
                 if let Err(e) = nixe(socket::bind(listener, &nix_addr)) {
                     let _ = nix::unistd::close(listener);

@@ -5,6 +5,7 @@ use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddr, Shutdown};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
@@ -15,6 +16,8 @@ use mio::{Evented, PollOpt, Ready, Token};
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixListener, UnixStream, UnixDatagram};
+#[cfg(unix)]
+use nix::sys::socket::{getsockopt, sockopt::*};
 
 use crate::client_limiter::ClientStats;
 use crate::ServiceSocket;
@@ -82,10 +85,14 @@ fn shutdown_direction(direction: Shutdown) -> &'static str {
 }
 
 /// How many bytes an open connection should count as.
-/// This should include buffers and structs used by the OS as well as structs
+/// This should include structs used by the OS as well as structs
 /// and fixed tiny buffers used by this program.
 /// TODO calculate based on fd limit to prevent EMFILE DoS attack
-const TCP_CONNECTION_COST: usize = 2000; // guess
+const TCP_CONNECTION_COST: usize = 200; // guess
+const ASSUMED_TCP_RECEIVE_BUFFER_SIZE: usize = 60_000;
+const ASSUMED_TCP_SEND_BUFFER_SIZE: usize = 16_000;
+/// The sum of receive and send buffer sizes reported for the first connection
+static TCP_BUFFERS_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 // want to try to handle short-lived connections without registering them,
 // but after passing the socket to the callback we don't have access to it
@@ -117,7 +124,38 @@ pub fn tcp_accept_loop<
                 return Remove;
             }
             Ok((stream, addr)) => {
-                let res = match server.limits.request_resources_ref(addr, TCP_CONNECTION_COST) {
+                let mut buffers_size = TCP_BUFFERS_SIZE.load(Ordering::Relaxed);
+                if buffers_size == 0 {
+                    #[cfg(unix)] {
+                        buffers_size += match getsockopt(stream.as_raw_fd(), RcvBuf) {
+                            Ok(receive_size) => {
+                                println!("tcp receive buffer size is {}", receive_size);
+                                receive_size
+                            }
+                            Err(e) => {
+                                eprintln!("Cannot get tcp receive buffer size: {}", e);
+                                ASSUMED_TCP_RECEIVE_BUFFER_SIZE
+                            }
+                        };
+                        buffers_size += match getsockopt(stream.as_raw_fd(), SndBuf) {
+                            Ok(send_size) => {
+                                println!("tcp send buffer size is {}", send_size);
+                                send_size
+                            }
+                            Err(e) => {
+                                eprintln!("Cannot get tcp send buffer size: {}", e);
+                                ASSUMED_TCP_SEND_BUFFER_SIZE
+                            }
+                        };
+                    }
+                    #[cfg(not(unix))] {
+                        buffers_size += ASSUMED_TCP_RECEIVE_BUFFER_SIZE;
+                        buffers_size += ASSUMED_TCP_SEND_BUFFER_SIZE;
+                    }
+                    TCP_BUFFERS_SIZE.store(buffers_size, Ordering::SeqCst);
+                }
+                let tcp_connection_cost = TCP_CONNECTION_COST + buffers_size;
+                let res = match server.limits.request_resources_ref(addr, tcp_connection_cost) {
                     Some(res) => res,
                     None => {
                         // Once the connection is ready to accept(), the
