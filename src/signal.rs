@@ -100,6 +100,10 @@ impl SignalReceiver {
         if let Err(e) = unsafe { signal::sigaction(signal::SIGTERM, &shutdown_action) } {
             eprintln!("Cannot set SIGTERM handler: {}", e);
         }
+        if let Err(e) = unsafe { signal::sigaction(signal::SIGPIPE, &shutdown_action) } {
+            eprintln!("Cennot set SIGPIPE handler: {}", e);
+        }
+
         let stats_action = signal::SigAction::new(
             signal::SigHandler::Handler(signal_stats),
             signal::SaFlags::empty(),
