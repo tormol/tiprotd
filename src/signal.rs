@@ -65,12 +65,12 @@ impl SignalReceiver {
             }
         };
         fcntl::fcntl(reader, fcntl::F_SETFL(fcntl::OFlag::O_NONBLOCK)).unwrap();
-        if let Ok(default_size) = fcntl::fcntl(reader, fcntl::F_GETPIPE_SZ) {
-            println!("self-pipe buffer size is {}", default_size);
-        }
+        // if let Ok(default_size) = fcntl::fcntl(reader, fcntl::F_GETPIPE_SZ) {
+        //     println!("self-pipe buffer size is {}", default_size);
+        // }
         #[cfg(any(target_os="linux", target_os="android"))]
         match fcntl::fcntl(reader, fcntl::F_SETPIPE_SZ(8)) {
-            Ok(set_size) => println!("Set self-pipe buffer size to {}", set_size),
+            Ok(_set_size) => {/*println!("Set self-pipe buffer size to {}", set_size)*/},
             Err(e) => eprintln!("Cannot set self-pipe buffer size: {}", e),
         }
 
@@ -118,7 +118,7 @@ impl SignalReceiver {
     }
 
     pub fn ready(&mut self,  _: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
-        println!("signal ready");
+        // println!("signal ready");
         loop {
             match read(self.reader, &mut server.buffer) {
                 Err(ref e) if e.as_errno() == Some(nix::errno::EWOULDBLOCK) => return EntryStatus::Drained,
@@ -145,7 +145,7 @@ impl SignalReceiver {
 }
 
 fn start_shutdown(server: &mut Server) {
-    println!("shutting down");
+    // println!("shutting down");
     for i in 0..server.sockets.len() {
         let descriptor = match server.sockets.get(i).and_then(|entry| entry.inner_descriptor() ) {
             Some(descriptor) => descriptor.as_any(),

@@ -201,7 +201,7 @@ impl Server {
             |addr| {
                 use std::os::unix::io::FromRawFd;
                 use nix::sys::socket::{self, AddressFamily, SockType, SockFlag};
-                use nix::sys::socket::{getsockopt, setsockopt, sockopt::*};
+                use nix::sys::socket::{/*getsockopt,*/ setsockopt, sockopt::*};
                 let family = match addr {
                     SocketAddr::V6(_) => AddressFamily::Inet6,
                     SocketAddr::V4(_) => AddressFamily::Inet,
@@ -213,21 +213,21 @@ impl Server {
                     let _ = nix::unistd::close(listener);
                     return Err(e);
                 }
-                if let Ok(default_size) = getsockopt(listener, RcvBuf) {
-                    println!("tcp receive buffer size is {}", default_size);
-                }
+                // if let Ok(default_size) = getsockopt(listener, RcvBuf) {
+                //     println!("tcp receive buffer size is {}", default_size);
+                // }
                 if let Err(e) = setsockopt(listener, RcvBuf, &0) {
                     eprintln!("Cannot set tcp receive buffer size: {}", e);
-                } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
-                    println!("Set tcp receive buffer size to {}", set_size);
+                // } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
+                //     println!("Set tcp receive buffer size to {}", set_size);
                 }
-                if let Ok(default_size) = getsockopt(listener, SndBuf) {
-                    println!("tcp send buffer size is {}", default_size);
-                }
+                // if let Ok(default_size) = getsockopt(listener, SndBuf) {
+                //     println!("tcp send buffer size is {}", default_size);
+                // }
                 if let Err(e) = setsockopt(listener, SndBuf, &0) {
                     eprintln!("Cannot set tcp send buffer size: {}", e);
-                } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
-                    println!("Set tcp send buffer size to {}", set_size);
+                // } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
+                //     println!("Set tcp send buffer size to {}", set_size);
                 }
                 if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
                     let _ = nix::unistd::close(listener);
