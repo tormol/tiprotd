@@ -54,8 +54,12 @@ const NONRESERVED_PORT_OFFSET: u16 = 10_000;
 const LIMITS_DURATION: Duration = Duration::from_secs(10*60);
 /// Hom many UDP bytes + packets can be sent to a client per `LIMITS_DURATION`
 const UDP_SEND_LIMIT: u32 = 1*1024*1024;
-/// How many resources a client is allowwed to consume at any point
-const RESOURCE_LIMIT: u32 = 500*1024;
+/// How many resources a client is allowwed to consume at any point, in bytes.
+/// 256 kB is much higher than any honest client will need,
+/// but high enough to exceed the capacity of client's default receive buffer,
+/// which simplifies testing. It is still low enough to prevent somebody with a
+/// /24 block from DoSing.
+const RESOURCE_LIMIT: u32 = 256*1024;
 
 pub enum ServiceSocket {
     #[cfg(unix)]

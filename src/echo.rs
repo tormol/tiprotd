@@ -47,6 +47,8 @@ fn tcp_echo(conn: &mut TcpStreamWrapper,  unsent: &mut VecDeque<u8>,  recv_shutd
                     if conn.limit_counters.request_resources(2*len) {
                         unsent.extend(&buffer[..len]);
                         unsent.extend(&buffer[..len]);
+                    } else {
+                        return Remove;
                     }
                 }
                 Ok(0) => {
