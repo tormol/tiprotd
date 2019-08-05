@@ -156,10 +156,10 @@ pub enum QotdSocket {
 
 impl QotdSocket {
     pub fn setup(server: &mut Server) {
-        server.listen_tcp(QOTD_PORT, "qotd",
+        listen_tcp(server, "qotd", QOTD_PORT,
             &mut|listener, Token(_)| ServiceSocket::Qotd(QotdSocket::TcpListener(listener))
         );
-        server.listen_udp(QOTD_PORT, Ready::readable() | Ready::writable(), "qotd",
+        listen_udp(server, "qotd", QOTD_PORT, Ready::readable() | Ready::writable(),
             &mut|socket, Token(_)| ServiceSocket::Qotd(QotdSocket::Udp(socket, HashSet::new()))
         );
         #[cfg(unix)]
@@ -171,7 +171,7 @@ impl QotdSocket {
             |socket| ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, Vec::new()))
         );
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-        server.setup_mq("qotd", Ready::writable(),
+        listen_posixmq(server, "qotd", Ready::writable(),
             posixmq::OpenOptions::writeonly().mode(0o644).max_msg_len(QOTD.len()).capacity(1),
             &mut|mq, Token(_)| ServiceSocket::Qotd(QotdSocket::PosixMq(mq))
         );
@@ -303,10 +303,10 @@ fn new_time32() -> [u8;4] {
 
 impl Time32Socket {
     pub fn setup(server: &mut Server) {
-        server.listen_tcp(TIME32_PORT, "time32",
+        listen_tcp(server, "time32", TIME32_PORT,
             &mut|listener, Token(_)| ServiceSocket::Time32(Time32Socket::TcpListener(listener))
         );
-        server.listen_udp(TIME32_PORT, Ready::readable() | Ready::writable(), "time32",
+        listen_udp(server, "time32", TIME32_PORT, Ready::readable() | Ready::writable(),
             &mut|socket, Token(_)| ServiceSocket::Time32(Time32Socket::Udp(socket, HashSet::new()))
         );
         #[cfg(unix)]

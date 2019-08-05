@@ -76,6 +76,87 @@ pub fn now() -> impl Display {
 pub enum EntryStatus { Drained, Unfinished, Remove }
 pub use EntryStatus::*;
 
+
+/// Convert a nix result to a std::io result.
+///
+/// It maps nix::Error::Sys to std::io::Error::last_os_error() (because nix's
+/// Errno is lossy) and panics on any nix invented error.
+#[cfg(unix)]
+fn nixe<T>(nix_result: Result<T, nix::Error>) -> Result<T, io::Error> {
+    match nix_result {
+        Ok(success) => Ok(success),
+        Err(nix::Error::Sys(_)) => Err(io::Error::last_os_error()),
+        Err(nix_invented) => panic!("nix caused error: {}", nix_invented)
+    }
+}
+
+/// Create a mio TcpListener for the specified port and register it.
+///
+/// Might in the future be changed to create multiple listeners,
+/// such as one for IPv4 and one for IPv6.
+///
+/// OS are made to as small as possible on *nix.
+pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
+        encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
+) {
+    #[cfg(not(unix))]
+    let res = server.try_bind_ip("tcp", service_name, port, Ready::readable(),
+        |addr| TcpListener::bind(&addr)
+    );
+    #[cfg(unix)]
+    let res = server.try_bind_ip("tcp", service_name, port, Ready::readable(),
+        |addr| {
+            use std::os::unix::io::FromRawFd;
+            use nix::sys::socket::{self, AddressFamily, SockType, SockFlag};
+            use nix::sys::socket::{/*getsockopt,*/ setsockopt, sockopt::*};
+            let family = match addr {
+                SocketAddr::V6(_) => AddressFamily::Inet6,
+                SocketAddr::V4(_) => AddressFamily::Inet,
+            };
+            let options = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+            let listener = nixe(socket::socket(family, SockType::Stream, options, None))?;
+            if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
+                eprintln!("Connot set SO_REUSEADDR for tcp://{}: {}, continuing anyway",
+                    addr, e
+                );
+            }
+            let nix_addr = socket::SockAddr::Inet(socket::InetAddr::from_std(&addr));
+            if let Err(e) = nixe(socket::bind(listener, &nix_addr)) {
+                let _ = nix::unistd::close(listener);
+                return Err(e);
+            }
+            // if let Ok(default_size) = getsockopt(listener, RcvBuf) {
+            //     println!("tcp receive buffer size is {}", default_size);
+            // }
+            if let Err(e) = setsockopt(listener, RcvBuf, &0) {
+                eprintln!("Cannot set tcp receive buffer size: {}", e);
+            // } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
+            //     println!("Set tcp receive buffer size to {}", set_size);
+            }
+            // if let Ok(default_size) = getsockopt(listener, SndBuf) {
+            //     println!("tcp send buffer size is {}", default_size);
+            // }
+            if let Err(e) = setsockopt(listener, SndBuf, &0) {
+                eprintln!("Cannot set tcp send buffer size: {}", e);
+            // } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
+            //     println!("Set tcp send buffer size to {}", set_size);
+            }
+            if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
+                let _ = nix::unistd::close(listener);
+                return Err(e);
+            }
+            unsafe { Ok(TcpListener::from_raw_fd(listener)) }
+        }
+    );
+    if let Some((listener, entry)) = res {
+        let token = Token(entry.key()); // make borrowck happy
+        entry.insert(encapsulate(listener, token));
+    } else {
+        std::process::exit(1);
+    }
+}
+
+
 fn shutdown_direction(direction: Shutdown) -> &'static str {
     match direction {
         Shutdown::Both => "",
@@ -241,6 +322,20 @@ impl TcpStreamWrapper {
         }
     }
 }
+
+
+/// Create a mio UdpSocket bound to the specified port and register it.
+pub fn listen_udp(server: &mut Server,  service_name: &'static str,
+        port: u16,  poll_for: Ready,
+        encapsulate: &mut dyn FnMut(UdpSocket, Token)->ServiceSocket
+) {
+    let (socket, entry) = server.try_bind_ip("udp", service_name, port, poll_for,
+        |addr| UdpSocket::bind(&addr)
+    ).unwrap_or_else(|| std::process::exit(1) );
+    let token = Token(entry.key()); // make borrowck happy
+    entry.insert(encapsulate(socket, token));
+}
+
 
 /// also for listeners, deletes on drop if named
 #[cfg(unix)]
@@ -521,5 +616,33 @@ pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &UnixSocketAddr
     } else {
         eprintln!("std doesn't allow sending unix datagram to {:?}, sorry", to);
         true
+    }
+}
+
+
+/// Create a posix message queue, open it as nonblocking and register it with mio.
+///
+/// capacity and max message size should be set via the options parameter.
+#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+pub fn listen_posixmq(server: &mut Server,  service_name: &'static str,  poll_for: Ready,
+        options: &mut posixmq::OpenOptions,
+        encapsulate: &mut dyn FnMut(PosixMqWrapper, Token)->ServiceSocket
+) {
+    match options.create().nonblocking().open(service_name) {
+        Ok(mq) => {
+            let entry = server.sockets.vacant_entry();
+            let token = Token(entry.key());
+            let res = server.poll.register(&mq, token, poll_for, mio::PollOpt::edge());
+            if let Err(e) = res {
+                eprintln!("Cannot register posix message queue /{} with mio: {}, skipping",
+                    service_name, e
+                );
+            } else {
+                entry.insert(encapsulate(PosixMqWrapper(mq, service_name), token));
+            }
+        }
+        Err(e) => {
+            eprintln!("Cannot open posix message queue /{}: {}", service_name, e);
+        }
     }
 }

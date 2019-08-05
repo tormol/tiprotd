@@ -150,10 +150,10 @@ use self::EchoSocket::*;
 
 impl EchoSocket {
     pub fn setup(server: &mut Server) {
-        server.listen_tcp(ECHO_PORT, "echo",
+        listen_tcp(server, "echo", ECHO_PORT,
             &mut|listener, Token(_)| ServiceSocket::Echo(TcpListener(listener))
         );
-        server.listen_udp(ECHO_PORT, Ready::readable() | Ready::writable(), "echo",
+        listen_udp(server, "echo", ECHO_PORT, Ready::readable() | Ready::writable(),
             &mut|socket, Token(_)| ServiceSocket::Echo(Udp(socket, VecDeque::new()))
         );
         #[cfg(unix)]

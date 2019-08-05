@@ -42,7 +42,6 @@ use std::mem;
 use std::time::Duration;
 
 use mio::{Token, Poll, PollOpt, Ready, Events};
-use mio::net::{TcpListener, UdpSocket};
 use slab::Slab;
 
 
@@ -106,19 +105,6 @@ impl ServiceSocket {
     }
 }
 
-/// Convert a nix result to a std::io result.
-///
-/// It maps nix::Error::Sys to std::io::Error::last_os_error() (because nix's
-/// Errno is lossy) and panics on any nix invented error.
-#[cfg(unix)]
-fn nixe<T>(nix_result: Result<T, nix::Error>) -> Result<T, io::Error> {
-    match nix_result {
-        Ok(success) => Ok(success),
-        Err(nix::Error::Sys(_)) => Err(io::Error::last_os_error()),
-        Err(nix_invented) => panic!("nix caused error: {}", nix_invented)
-    }
-}
-
 pub struct Server {
     poll: Poll,
     sockets: Slab<ServiceSocket>,
@@ -143,8 +129,8 @@ impl Server {
         }
     }
 
-    fn try_bind_ip<S: mio::Evented>(&mut self,  port: u16,
-            service_name: &str,  protocol_name: &str,
+    fn try_bind_ip<S: mio::Evented>(&mut self,
+            protocol_name: &str,  service_name: &str,  port: u16,
             poll_for: Ready,  binder: fn(SocketAddr)->io::Result<S>,
     ) -> Option<(S, slab::VacantEntry<ServiceSocket>)> {
         let on = SocketAddr::from((ANY, port+self.port_offset.unwrap_or(0)));
@@ -158,7 +144,7 @@ impl Server {
             Err(ref e) if e.kind() == ErrorKind::PermissionDenied && self.port_offset == None => {
                 eprintln!("Doesn't have permission to listen on reserved ports, falling back to 10_000+port");
                 self.port_offset = Some(NONRESERVED_PORT_OFFSET);
-                self.try_bind_ip(port, protocol_name, service_name, poll_for, binder)
+                self.try_bind_ip(protocol_name, service_name, port, poll_for, binder)
             }
             Err(e) => {
                 eprintln!("Cannot listen on {}://{} (for {}): {}",
@@ -167,100 +153,6 @@ impl Server {
                 None
             }
         }
-    }
-
-    #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-    fn setup_mq(&mut self,  service_name: &'static str,  poll_for: Ready,
-            options: &mut posixmq::OpenOptions,
-            encapsulate: &mut dyn FnMut(PosixMqWrapper, Token)->ServiceSocket
-    ) {
-        match options.create().nonblocking().open(service_name) {
-            Ok(mq) => {
-                let entry = self.sockets.vacant_entry();
-                let token = Token(entry.key());
-                let res = self.poll.register(&mq, token, poll_for, mio::PollOpt::edge());
-                if let Err(e) = res {
-                    eprintln!("Cannot register posix message queue /{} with mio: {}, skipping",
-                        service_name, e
-                    );
-                } else {
-                    entry.insert(encapsulate(PosixMqWrapper(mq, service_name), token));
-                }
-            }
-            Err(e) => {
-                eprintln!("Cannot open posix message queue /{}: {}", service_name, e);
-            }
-        }
-    }
-
-    fn listen_tcp(&mut self,  port: u16,  service_name: &'static str,
-            encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
-    ) {
-        #[cfg(not(unix))]
-        let res = self.try_bind_ip(port, "tcp", service_name, Ready::readable(),
-            |addr| TcpListener::bind(&addr)
-        );
-        #[cfg(unix)]
-        let res = self.try_bind_ip(port, "tcp", service_name, Ready::readable(),
-            |addr| {
-                use std::os::unix::io::FromRawFd;
-                use nix::sys::socket::{self, AddressFamily, SockType, SockFlag};
-                use nix::sys::socket::{/*getsockopt,*/ setsockopt, sockopt::*};
-                let family = match addr {
-                    SocketAddr::V6(_) => AddressFamily::Inet6,
-                    SocketAddr::V4(_) => AddressFamily::Inet,
-                };
-                let options = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
-                let listener = nixe(socket::socket(family, SockType::Stream, options, None))?;
-                if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
-                    eprintln!("Connot set SO_REUSEADDR for tcp://{}: {}, continuing anyway",
-                        addr, e
-                    );
-                }
-                let nix_addr = socket::SockAddr::Inet(socket::InetAddr::from_std(&addr));
-                if let Err(e) = nixe(socket::bind(listener, &nix_addr)) {
-                    let _ = nix::unistd::close(listener);
-                    return Err(e);
-                }
-                // if let Ok(default_size) = getsockopt(listener, RcvBuf) {
-                //     println!("tcp receive buffer size is {}", default_size);
-                // }
-                if let Err(e) = setsockopt(listener, RcvBuf, &0) {
-                    eprintln!("Cannot set tcp receive buffer size: {}", e);
-                // } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
-                //     println!("Set tcp receive buffer size to {}", set_size);
-                }
-                // if let Ok(default_size) = getsockopt(listener, SndBuf) {
-                //     println!("tcp send buffer size is {}", default_size);
-                // }
-                if let Err(e) = setsockopt(listener, SndBuf, &0) {
-                    eprintln!("Cannot set tcp send buffer size: {}", e);
-                // } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
-                //     println!("Set tcp send buffer size to {}", set_size);
-                }
-                if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
-                    let _ = nix::unistd::close(listener);
-                    return Err(e);
-                }
-                unsafe { Ok(TcpListener::from_raw_fd(listener)) }
-            }
-        );
-        if let Some((listener, entry)) = res {
-            let token = Token(entry.key()); // make borrowck happy
-            entry.insert(encapsulate(listener, token));
-        } else {
-            std::process::exit(1);
-        }
-    }
-
-    fn listen_udp(&mut self,  port: u16,  poll_for: Ready,  service_name: &'static str,
-            encapsulate: &mut dyn FnMut(UdpSocket, Token)->ServiceSocket
-    ) {
-        let (socket, entry) = self.try_bind_ip(port, service_name, "udp", poll_for,
-            |addr| UdpSocket::bind(&addr)
-        ).unwrap_or_else(|| std::process::exit(1) );
-        let token = Token(entry.key()); // make borrowck happy
-        entry.insert(encapsulate(socket, token));
     }
 
     fn trigger(&mut self,  readiness: Ready,  mut socket: ServiceSocket,  token: Token) {

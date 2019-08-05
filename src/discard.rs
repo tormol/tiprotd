@@ -47,10 +47,10 @@ fn anti_discard(from: &dyn Debug,  protocol: &str,  bytes: &[u8]) {
 
 impl DiscardSocket {
     pub fn setup(server: &mut Server) {
-        server.listen_tcp(DISCARD_PORT, "discard",
+        listen_tcp(server, "discard", DISCARD_PORT,
             &mut|listener, Token(_)| ServiceSocket::Discard(TcpListener(listener))
         );
-        server.listen_udp(DISCARD_PORT, Ready::readable(), "discard",
+        listen_udp(server, "discard", DISCARD_PORT, Ready::readable(),
             &mut|socket, Token(_)| ServiceSocket::Discard(Udp(socket))
         );
         #[cfg(unix)]
@@ -62,7 +62,7 @@ impl DiscardSocket {
             |socket| ServiceSocket::Discard(UnixDatagram(socket))
         );
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-        server.setup_mq("discard", Ready::readable(),
+        listen_posixmq(server, "discard", Ready::readable(),
             posixmq::OpenOptions::readonly()
                 .mode(0o622)
                 .max_msg_len(server.buffer.len())
