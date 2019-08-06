@@ -7,7 +7,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
@@ -17,7 +17,7 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixListener, UnixStream, UnixDatagram};
 #[cfg(unix)]
-use nix::sys::socket::{getsockopt, sockopt::*};
+use nix::sys::socket::{getsockopt, setsockopt, sockopt::*};
 
 use crate::client_limiter::ClientStats;
 use crate::ServiceSocket;
@@ -106,17 +106,16 @@ pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
     #[cfg(unix)]
     let res = server.try_bind_ip("tcp", service_name, port, Ready::readable(),
         |addr| {
-            use std::os::unix::io::FromRawFd;
             use nix::sys::socket::{self, AddressFamily, SockType, SockFlag};
-            use nix::sys::socket::{/*getsockopt,*/ setsockopt, sockopt::*};
             let family = match addr {
                 SocketAddr::V6(_) => AddressFamily::Inet6,
                 SocketAddr::V4(_) => AddressFamily::Inet,
             };
+            // FIXME these flags are not available on macOS
             let options = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
             let listener = nixe(socket::socket(family, SockType::Stream, options, None))?;
             if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
-                eprintln!("Connot set SO_REUSEADDR for tcp://{}: {}, continuing anyway",
+                eprintln!("Connot set SO_REUSEADDR for tcp://{}: {}, continuing anyway.",
                     addr, e
                 );
             }
