@@ -333,6 +333,50 @@ pub fn listen_udp(server: &mut Server,  service_name: &'static str,
     ).unwrap_or_else(|| std::process::exit(1) );
     let token = Token(entry.key()); // make borrowck happy
     entry.insert(encapsulate(socket, token));
+    #[cfg(any(target_os="linux", target_os="freebsd"))]
+    listen_udplite(server, service_name, port, poll_for, encapsulate);
+}
+
+
+/// Create a mio UdpSocket actually representing an UDP-lite socket
+/// bound to the specified port and register it.
+#[cfg(any(target_os="linux", target_os="freebsd"))]
+pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
+        port: u16,  poll_for: Ready,
+        encapsulate: &mut dyn FnMut(UdpSocket, Token)->ServiceSocket
+) {
+    let (socket, entry) = server.try_bind_ip("udplite", service_name, port, poll_for,
+        |addr| {
+            use nix::libc;
+            use nix::sys::socket::{bind, InetAddr, SockAddr};
+            let family = match addr {
+                SocketAddr::V6(_) => libc::AF_INET6,
+                SocketAddr::V4(_) => libc::AF_INET,
+            };
+            let options = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+            let socket = unsafe { libc::socket(
+                    family,
+                    libc::SOCK_DGRAM | options,
+                    libc::IPPROTO_UDPLITE
+            ) };
+            if socket == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if let Err(e) = nixe(setsockopt(socket, ReuseAddr, &true)) {
+                eprintln!("Connot set SO_REUSEADDR for udplite://{}: {}, continuing anyway.",
+                    addr, e
+                );
+            }
+            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
+            if let Err(e) = nixe(bind(socket, &nix_addr)) {
+                let _ = nix::unistd::close(socket);
+                return Err(e);
+            }
+            unsafe { Ok(UdpSocket::from_raw_fd(socket)) }
+        }
+    ).unwrap_or_else(|| std::process::exit(1) );
+    let token = Token(entry.key());
+    entry.insert(encapsulate(socket, token));
 }
 
 
