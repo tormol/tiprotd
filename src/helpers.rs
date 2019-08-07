@@ -153,6 +153,9 @@ pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
     } else {
         std::process::exit(1);
     }
+
+    #[cfg(all(unix, not(any(target_os="macos", target_os="dragonfly", target_os="openbsd"))))]
+    listen_sctp(server, service_name, port, encapsulate);
 }
 
 
@@ -319,6 +322,67 @@ impl TcpStreamWrapper {
         } else {
             self.shutdown(Shutdown::Both);
         }
+    }
+}
+
+
+#[cfg(all(unix, not(any(target_os="macos", target_os="dragonfly", target_os="openbsd"))))]
+pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
+        encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
+) {
+    let res = server.try_bind_ip("sctp", service_name, port, Ready::readable(),
+        |addr| {
+            use nix::sys::socket;
+            use nix::libc;
+            use std::os::raw::c_int;
+            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
+            let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
+            let options = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+            let listener = unsafe { libc::socket(
+                    sockaddr.sa_family as c_int,
+                    libc::SOCK_STREAM | options,
+                    libc::IPPROTO_SCTP
+            ) };
+            if listener == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
+                eprintln!("Connot set SO_REUSEADDR for sctp://{}: {}, continuing anyway.",
+                    addr, e
+                );
+            }
+            if unsafe { libc::bind(listener, sockaddr, socklen) } != 0 {
+                let _ = unsafe { libc::close(listener) };
+                return Err(io::Error::last_os_error());
+            }
+            if let Ok(default_size) = getsockopt(listener, RcvBuf) {
+                println!("sctp receive buffer size is {}", default_size);
+            }
+            if let Err(e) = setsockopt(listener, RcvBuf, &0) {
+                eprintln!("Cannot set sctp receive buffer size: {}", e);
+            } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
+                println!("Set sctp receive buffer size to {}", set_size);
+            }
+            if let Ok(default_size) = getsockopt(listener, SndBuf) {
+                println!("sctp send buffer size is {}", default_size);
+            }
+            if let Err(e) = setsockopt(listener, SndBuf, &0) {
+                eprintln!("Cannot set sctp send buffer size: {}", e);
+            } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
+                println!("Set sctp send buffer size to {}", set_size);
+            }
+            if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
+                let _ = nix::unistd::close(listener);
+                return Err(e);
+            }
+            unsafe { Ok(TcpListener::from_raw_fd(listener)) }
+        }
+    );
+    if let Some((listener, entry)) = res {
+        let token = Token(entry.key()); // make borrowck happy
+        entry.insert(encapsulate(listener, token));
+    } else {
+        std::process::exit(1);
     }
 }
 
