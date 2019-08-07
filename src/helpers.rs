@@ -18,6 +18,8 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio_uds::{UnixListener, UnixStream, UnixDatagram};
 #[cfg(unix)]
 use nix::sys::socket::{getsockopt, setsockopt, sockopt::*};
+#[cfg(unix)]
+use nix::sys::socket::{InetAddr, SockAddr};
 
 use crate::client_limiter::ClientStats;
 use crate::ServiceSocket;
@@ -412,14 +414,12 @@ pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
     let (socket, entry) = server.try_bind_ip("udplite", service_name, port, poll_for,
         |addr| {
             use nix::libc;
-            use nix::sys::socket::{bind, InetAddr, SockAddr};
-            let family = match addr {
-                SocketAddr::V6(_) => libc::AF_INET6,
-                SocketAddr::V4(_) => libc::AF_INET,
-            };
+            use std::os::raw::{c_int, c_void};
+            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
+            let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
             let options = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
             let socket = unsafe { libc::socket(
-                    family,
+                    sockaddr.sa_family as c_int,
                     libc::SOCK_DGRAM | options,
                     libc::IPPROTO_UDPLITE
             ) };
@@ -431,10 +431,24 @@ pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
                     addr, e
                 );
             }
-            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
-            if let Err(e) = nixe(bind(socket, &nix_addr)) {
-                let _ = nix::unistd::close(socket);
-                return Err(e);
+            if unsafe { libc::bind(socket, sockaddr, socklen) } != 0 {
+                let _ = unsafe { libc::close(socket) };
+                return Err(io::Error::last_os_error());
+            }
+            #[cfg(target_os="linux")]
+            const UDPLITE_SEND_CSCOV: c_int = 10;
+            #[cfg(target_os="linux")]
+            const UDPLITE_RECV_CSCOV: c_int = 11;
+            let ret = unsafe { libc::setsockopt(socket,
+                    libc::IPPROTO_UDPLITE,
+                    UDPLITE_SEND_CSCOV,
+                    &8 as *const c_int as *const c_void,
+                    std::mem::size_of::<c_int>() as libc::socklen_t
+            ) };
+            if ret != 0 {
+                eprintln!("Connot set UDPLITE_SEND_CSCOV for udplite://{}: {}, continuing anyway.",
+                    addr, io::Error::last_os_error()
+                );
             }
             unsafe { Ok(UdpSocket::from_raw_fd(socket)) }
         }
