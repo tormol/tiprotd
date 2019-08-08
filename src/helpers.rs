@@ -1,15 +1,17 @@
 use std::any::Any;
 use std::error::Error;
-use std::fmt::Display;
+use std::fmt::{self, Display, Formatter};
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddr, Shutdown};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
+#[cfg(unix)]
+use std::os::raw::{c_int, c_char};
 
 use chrono::Local;
 use mio::{Evented, PollOpt, Ready, Token};
@@ -20,10 +22,54 @@ use mio_uds::{UnixListener, UnixStream, UnixDatagram};
 use nix::sys::socket::{getsockopt, setsockopt, sockopt::*};
 #[cfg(unix)]
 use nix::sys::socket::{InetAddr, SockAddr};
+#[cfg(unix)]
+use nix::libc;
 
 use crate::client_limiter::ClientStats;
 use crate::ServiceSocket;
 use crate::Server;
+
+
+#[derive(Clone,Copy, PartialEq,Eq,Hash, Debug)]
+#[repr(u8)]
+#[allow(unused)] // don't want to cfg out unsupported protocols
+pub enum Protocol {
+    Unknown=0,
+    Tcp=1, Udp=2, Sctp=3, Udplite=4, Dccp=5,
+    Uds=6, Uddg=7, Udsq=8,
+    PosixMq=9, Pipe=10,
+}
+impl Protocol {
+    pub fn url_identifier(self) -> &'static str {
+        [
+            "???",
+            "tcp", "udp", "sctp", "udplite", "dccp",
+            "uds", "uddg", "udsq",
+            "posixmq", "pipe",
+        ][self as u8 as usize]
+    }
+    pub fn prefix(self) -> &'static str {
+        [
+            "",
+            "tcp://", "udp://", "sctp://", "udplite://", "dccp://",
+            "unix stream socket ", "unix datagram socket ", "unix seqpacket socket ",
+            "posix message queue ", "pipe ",
+        ][self as u8 as usize]
+    }
+    pub fn description(self) -> &'static str {
+        [
+            "unknown",
+            "TCP", "UDP", "SCTP", "UDPlite", "DCCP",
+            "unix stream", "unix datagram", "unix seqpacket",
+            "posix message queue", "pipe",
+        ][self as u8 as usize]
+    }
+}
+impl Display for Protocol {
+    fn fmt(&self,  fmtr: &mut Formatter) -> fmt::Result {
+        fmtr.write_str(self.url_identifier())
+    }
+}
 
 #[cfg(unix)]
 pub trait Descriptor: AsRawFd + Evented + Any+'static {
@@ -39,6 +85,7 @@ impl<T: AsRawFd+Evented+Any+Sized> Descriptor for T {
 pub trait Descriptor: Evented + Any {}
 #[cfg(not(unix))]
 impl<T: Evented+Any> Descriptor for T {}
+
 // pub enum Socket<'a> {
 //     TcpStream(&'a TcpStream),
 //     TcpListener(&'a TcpListener),
@@ -46,6 +93,7 @@ impl<T: Evented+Any> Descriptor for T {}
 //     #[cfg(unix)]// all other
 //     Any(&'a dyn Descriptor),
 // }
+
 
 /// Converts ::ffff:0.0.0.0/96 and ::0.0.0.0/96 ( except ::1 and ::) to IPv4 socket addresses.
 ///
@@ -92,6 +140,82 @@ fn nixe<T>(nix_result: Result<T, nix::Error>) -> Result<T, io::Error> {
     }
 }
 
+#[cfg(unix)]
+fn create_incoming_socket(protocol: Protocol,
+        typ: c_int,  variant: c_int,
+        bind_addr: &libc::sockaddr,  addrlen: libc::socklen_t,
+        set_buffers: Option<usize>,  log_buffers: bool,
+        listen_backlog: Option<u16>,
+) -> Result<RawFd, io::Error> {
+    // FIXME these flags are not available on macOS
+    let options = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    let socket = unsafe { libc::socket(
+            bind_addr.sa_family as c_int,
+            typ | options,
+            variant
+    ) };
+    if socket == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Err(e) = nixe(setsockopt(socket, ReuseAddr, &true)) {
+        eprintln!("Connot set SO_REUSEADDR for {} socket: {}", protocol.description(), e);
+    }
+    if log_buffers {
+        if let Ok(default_size) = getsockopt(socket, RcvBuf) {
+            println!("{} default receive buffer size is {}", protocol.description(), default_size);
+        }
+        if let Ok(default_size) = getsockopt(socket, SndBuf) {
+            println!("{} default send buffer size is {}", protocol.description(), default_size);
+        }
+    }
+    if let Some(set_to) = set_buffers {
+        if let Err(e) = setsockopt(socket, RcvBuf, &set_to) {
+            eprintln!("Cannot set {} socket receive buffer size to {}: {}",
+                protocol.description(), set_to, e
+            );
+        } else if log_buffers {
+            if let Ok(set_size) = getsockopt(socket, RcvBuf) {
+                println!("Set {} socket receive buffer size to {}",
+                    protocol.description(), set_size
+                );
+            }
+        }
+        if let Err(e) = setsockopt(socket, SndBuf, &set_to) {
+            eprintln!("Cannot set {} socket send buffer size to {}: {}",
+                protocol.description(), set_to, e
+            );
+        } else if log_buffers {
+            if let Ok(set_size) = getsockopt(socket, SndBuf) {
+                println!("Set {} socket send buffer size to {}",
+                    protocol.description(), set_size
+                );
+            }
+        }
+    }
+    if unsafe { libc::bind(socket, bind_addr, addrlen) } != 0 {
+        let bind_err = io::Error::last_os_error();
+        if unsafe { libc::close(socket) } != 0 {
+            eprintln!("Cannot close failed {} socket: {}",
+                protocol.description(), io::Error::last_os_error()
+            );
+        }
+        return Err(bind_err);
+    }
+    if let Some(backlog) = listen_backlog {
+        if unsafe { libc::listen(socket, backlog as c_int) } != 0 {
+            let listen_err = io::Error::last_os_error();
+            if unsafe { libc::close(socket) } != 0 {
+                eprintln!("Cannot close failed {} socket: {}",
+                    protocol.description(), io::Error::last_os_error()
+                );
+            }
+            return Err(listen_err);
+        }
+    }
+    Ok(socket)
+}
+
+
 /// Create a mio TcpListener for the specified port and register it.
 ///
 /// Might in the future be changed to create multiple listeners,
@@ -108,44 +232,12 @@ pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
     #[cfg(unix)]
     let res = server.try_bind_ip("tcp", service_name, port, Ready::readable(),
         |addr| {
-            use nix::sys::socket::{self, AddressFamily, SockType, SockFlag};
-            let family = match addr {
-                SocketAddr::V6(_) => AddressFamily::Inet6,
-                SocketAddr::V4(_) => AddressFamily::Inet,
-            };
-            // FIXME these flags are not available on macOS
-            let options = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
-            let listener = nixe(socket::socket(family, SockType::Stream, options, None))?;
-            if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
-                eprintln!("Connot set SO_REUSEADDR for tcp://{}: {}, continuing anyway.",
-                    addr, e
-                );
-            }
-            let nix_addr = socket::SockAddr::Inet(socket::InetAddr::from_std(&addr));
-            if let Err(e) = nixe(socket::bind(listener, &nix_addr)) {
-                let _ = nix::unistd::close(listener);
-                return Err(e);
-            }
-            // if let Ok(default_size) = getsockopt(listener, RcvBuf) {
-            //     println!("tcp receive buffer size is {}", default_size);
-            // }
-            if let Err(e) = setsockopt(listener, RcvBuf, &0) {
-                eprintln!("Cannot set tcp receive buffer size: {}", e);
-            // } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
-            //     println!("Set tcp receive buffer size to {}", set_size);
-            }
-            // if let Ok(default_size) = getsockopt(listener, SndBuf) {
-            //     println!("tcp send buffer size is {}", default_size);
-            // }
-            if let Err(e) = setsockopt(listener, SndBuf, &0) {
-                eprintln!("Cannot set tcp send buffer size: {}", e);
-            // } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
-            //     println!("Set tcp send buffer size to {}", set_size);
-            }
-            if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
-                let _ = nix::unistd::close(listener);
-                return Err(e);
-            }
+            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
+            let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
+            let listener = create_incoming_socket(Protocol::Tcp,
+                libc::SOCK_STREAM, 0, sockaddr, socklen,
+                Some(0), false, Some(10)/*FIXME find what std uses*/
+            )?;
             unsafe { Ok(TcpListener::from_raw_fd(listener)) }
         }
     );
@@ -336,49 +428,13 @@ pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
 ) {
     let res = server.try_bind_ip("sctp", service_name, port, Ready::readable(),
         |addr| {
-            use nix::sys::socket;
-            use nix::libc;
-            use std::os::raw::c_int;
             let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
             let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
-            let options = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
-            let listener = unsafe { libc::socket(
-                    sockaddr.sa_family as c_int,
-                    libc::SOCK_STREAM | options,
-                    libc::IPPROTO_SCTP
-            ) };
-            if listener == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
-                eprintln!("Connot set SO_REUSEADDR for sctp://{}: {}, continuing anyway.",
-                    addr, e
-                );
-            }
-            if unsafe { libc::bind(listener, sockaddr, socklen) } != 0 {
-                let _ = unsafe { libc::close(listener) };
-                return Err(io::Error::last_os_error());
-            }
-            if let Ok(default_size) = getsockopt(listener, RcvBuf) {
-                println!("sctp receive buffer size is {}", default_size);
-            }
-            if let Err(e) = setsockopt(listener, RcvBuf, &0) {
-                eprintln!("Cannot set sctp receive buffer size: {}", e);
-            } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
-                println!("Set sctp receive buffer size to {}", set_size);
-            }
-            if let Ok(default_size) = getsockopt(listener, SndBuf) {
-                println!("sctp send buffer size is {}", default_size);
-            }
-            if let Err(e) = setsockopt(listener, SndBuf, &0) {
-                eprintln!("Cannot set sctp send buffer size: {}", e);
-            } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
-                println!("Set sctp send buffer size to {}", set_size);
-            }
-            if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
-                let _ = nix::unistd::close(listener);
-                return Err(e);
-            }
+            let listener = create_incoming_socket(Protocol::Sctp,
+                    libc::SOCK_STREAM, libc::IPPROTO_SCTP,
+                    sockaddr, socklen,
+                    Some(0), false, Some(10/*FIXME*/),
+            )?;
             unsafe { Ok(TcpListener::from_raw_fd(listener)) }
         }
     );
@@ -396,49 +452,12 @@ pub fn listen_dccp(server: &mut Server,  service_name: &'static str,  port: u16,
 ) {
     let res = server.try_bind_ip("dccp", service_name, port, Ready::readable(),
         |addr| {
-            use nix::sys::socket;
-            use nix::libc;
-            use std::os::raw::c_int;
             let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
             let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
-            let options = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
-            let listener = unsafe { libc::socket(
-                    sockaddr.sa_family as c_int,
-                    libc::SOCK_DCCP | options,
-                    0
-            ) };
-            if listener == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if let Err(e) = nixe(setsockopt(listener, ReuseAddr, &true)) {
-                eprintln!("Connot set SO_REUSEADDR for dccp://{} listener: {}, continuing setting it up anyway..",
-                    addr, e
-                );
-            }
-            if unsafe { libc::bind(listener, sockaddr, socklen) } != 0 {
-                let _ = unsafe { libc::close(listener) };
-                return Err(io::Error::last_os_error());
-            }
-            if let Ok(default_size) = getsockopt(listener, RcvBuf) {
-                println!("dccp receive buffer size is {}", default_size);
-            }
-            if let Err(e) = setsockopt(listener, RcvBuf, &0) {
-                eprintln!("Cannot set dccp receive buffer size: {}", e);
-            } else if let Ok(set_size) = getsockopt(listener, RcvBuf) {
-                println!("Set dccp receive buffer size to {}", set_size);
-            }
-            if let Ok(default_size) = getsockopt(listener, SndBuf) {
-                println!("dccp send buffer size is {}", default_size);
-            }
-            if let Err(e) = setsockopt(listener, SndBuf, &0) {
-                eprintln!("Cannot set dccp send buffer size: {}", e);
-            } else if let Ok(set_size) = getsockopt(listener, SndBuf) {
-                println!("Set dccp send buffer size to {}", set_size);
-            }
-            if let Err(e) = nixe(socket::listen(listener, 10/*FIXME find what std uses*/)) {
-                let _ = nix::unistd::close(listener);
-                return Err(e);
-            }
+            let listener = create_incoming_socket(Protocol::Dccp,
+                    libc::SOCK_DCCP, 0, sockaddr, socklen,
+                    Some(0), false, Some(10/*FIXME*/),
+            )?;
             unsafe { Ok(TcpListener::from_raw_fd(listener)) }
         }
     );
@@ -475,28 +494,14 @@ pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
 ) {
     let (socket, entry) = server.try_bind_ip("udplite", service_name, port, poll_for,
         |addr| {
-            use nix::libc;
-            use std::os::raw::{c_int, c_void};
+            use std::os::raw::c_void;
             let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
             let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
-            let options = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
-            let socket = unsafe { libc::socket(
-                    sockaddr.sa_family as c_int,
-                    libc::SOCK_DGRAM | options,
-                    libc::IPPROTO_UDPLITE
-            ) };
-            if socket == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if let Err(e) = nixe(setsockopt(socket, ReuseAddr, &true)) {
-                eprintln!("Connot set SO_REUSEADDR for udplite://{}: {}, continuing anyway.",
-                    addr, e
-                );
-            }
-            if unsafe { libc::bind(socket, sockaddr, socklen) } != 0 {
-                let _ = unsafe { libc::close(socket) };
-                return Err(io::Error::last_os_error());
-            }
+            let socket = create_incoming_socket(Protocol::Udplite,
+                    libc::SOCK_DGRAM, libc::IPPROTO_UDPLITE,
+                    sockaddr, socklen,
+                    Some(0), false, None,
+            )?;
             #[cfg(target_os="linux")]
             const UDPLITE_SEND_CSCOV: c_int = 10;
             #[cfg(target_os="linux")]
@@ -578,7 +583,39 @@ impl UnixSocketWrapper<UnixListener> {
         if let Some(socket) = Self::create(on, server, |path| UnixListener::bind(path) ) {
             let entry = server.sockets.vacant_entry();
             server.poll.register(&*socket, Token(entry.key()), Ready::readable(), PollOpt::edge())
-                        .expect("Cannot register unix stream listener");
+                .expect("Cannot register unix stream listener");
+            entry.insert(encapsulate(socket));
+        }
+        Self::create_seqpacket_listener(service_name, server, encapsulate);
+    }
+
+    pub fn create_seqpacket_listener(service_name: &str,  server: &mut Server,
+            encapsulate: fn(Self)->ServiceSocket
+    ) {
+        let on = format!("{}_seqpacket.socket", service_name);
+        let res = Self::create(on, server, |path| {
+            let mut sockbuf = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+            sockbuf.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            if path.len() > std::mem::size_of_val(&sockbuf.sun_path) {
+                return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+            }
+            for (byte, dst) in path.bytes().zip(&mut sockbuf.sun_path[..]) {
+                *dst = byte as c_char;
+            }
+            let sockaddr = unsafe { &*(&sockbuf as *const _ as *const libc::sockaddr) };
+            let offset = &sockbuf.sun_path as *const _ as usize - &sockbuf as *const _ as usize;
+            let socklen = offset as libc::socklen_t + path.len() as libc::socklen_t;
+            let listener = create_incoming_socket(Protocol::Udsq,
+                    libc::SOCK_SEQPACKET, 0,
+                    &sockaddr, socklen,
+                    None, false, Some(10/*FIXME*/),
+            )?;
+            Ok(unsafe { UnixListener::from_raw_fd(listener) })
+        });
+        if let Some(socket) = res {
+            let entry = server.sockets.vacant_entry();
+            server.poll.register(&*socket, Token(entry.key()), Ready::readable(), PollOpt::edge())
+                .expect("Cannot register unix seqpacket listener");
             entry.insert(encapsulate(socket));
         }
     }
