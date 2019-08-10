@@ -19,7 +19,15 @@
 #include <stdarg.h> // used by checkerr()
 #include <stdbool.h>
 
-int checkerr(int ret, char *desc, ...) {
+#define BUFFER_SIZE 4096
+#define LISTEN_BACKLOG 10 // zero gives clients EUSERS. set high to reduce risk of errors
+
+
+/* helper functions */
+
+// print error messages and exit if `ret` is negative,
+// otherwise pass it through to caller.
+int checkerr(int ret, const char *desc, ...) {
     if (ret >= 0) {
         return ret;
     }
@@ -33,23 +41,19 @@ int checkerr(int ret, char *desc, ...) {
     exit(1);
 }
 
-#define UNUSED(x) (void)(x)
-#define STDIN 0
-#define STDOUT 1
-#define LISTEN_BACKLOG 10 // zero gives clients EUSERS, set high to reduce risk of errors
-
-in_port_t parseport(char *arg) {
+// parse string as unsigned short and detect and handle invalid input
+in_port_t parseport(const char *arg) {
     char *end;
     unsigned long num = strtoul(arg, &end, 10);
     if (*arg < '0' || *arg > '9' || *end != '\0' || num > 0xffff) {
-        fprintf(stderr, "bad port number %s\n", arg);
+        fprintf(stderr, "Bad port number %s\n", arg);
         exit(1);
     }
     return (in_port_t)num;
 }
 
-// format a socket address, using a global buffer
-char* sockaddr2str(struct sockaddr *sa) {
+// format a socket address, using a global buffer to avoid needing to free()
+char* sockaddr2str(const struct sockaddr *sa) {
     static char ipstr[100];
     if (sa->sa_family == AF_INET) {
         struct sockaddr_in *ipv4 = (struct sockaddr_in*)sa;
@@ -64,7 +68,7 @@ char* sockaddr2str(struct sockaddr *sa) {
         if (!memcmp(ipv6->sin6_addr.s6_addr, v4in6, sizeof(v4in6))) {
             snprintf(ipstr, sizeof(ipstr), "[%d.%d.%d.%d]:%d",
                 ipv6->sin6_addr.s6_addr[12], ipv6->sin6_addr.s6_addr[13],
-                ipv6->sin6_addr.s6_addr[14], ipv6->sin6_addr.s6_addr[15], 
+                ipv6->sin6_addr.s6_addr[14], ipv6->sin6_addr.s6_addr[15],
                 ntohs(ipv6->sin6_port)
             );
         } else {
@@ -78,28 +82,63 @@ char* sockaddr2str(struct sockaddr *sa) {
             snprintf(&ipstr[len], sizeof(ipstr)-len, "]:%d", ntohs(ipv6->sin6_port));
         }
         return ipstr;
-    } else if (sa->sa_family == AF_UNIX) {
-        struct sockaddr_un *local = (struct sockaddr_un*)sa;
-        return local->sun_path;
-    } else if (sa->sa_family == AF_UNSPEC) {
-        return "{unspecified}";
     } else {
-        snprintf(ipstr, sizeof(ipstr), "(address of unknown type %d)", sa->sa_family);
+        snprintf(ipstr, sizeof(ipstr), "{address of unexpected type %d}", sa->sa_family);
         return ipstr;
     }
 }
 
 // get the local address of the socket and format it using sockaddr2str()
-char* local2str(int socket) {
+char* local2str(int sock) {
     struct sockaddr_storage local;
     socklen_t len = sizeof(struct sockaddr_storage);
-    checkerr(getsockname(socket, (struct sockaddr*)&local, &len),
-        "get local address of socket %d", socket);
+    checkerr(getsockname(sock, (struct sockaddr*)&local, &len),
+        "get local address of socket %d", sock);
     return sockaddr2str((struct sockaddr*)&local);
 }
 
+
+/* simple socket-creation functions avoiding the complexity of getaddrinfo() for common cases */
+
+// create a socket and listen on any interface (both IPv6 and IPv4) at the given port
+int listen_any(const char *port) {
+    struct sockaddr_in6 any;
+    memset(&any, 0, sizeof(struct sockaddr_in6));
+    any.sin6_family = AF_INET6;
+    any.sin6_port = port==NULL ? 0 : htons(parseport(port));
+    any.sin6_addr = in6addr_any; // not really necessary; it's already zero
+    int listener = checkerr(socket(any.sin6_family, SOCK_DCCP, IPPROTO_DCCP),
+        "create DCCP socket");
+    // you probably want to set SO_REUSEADDR, see try_bind() below
+    checkerr(bind(listener, (struct sockaddr*)&any, sizeof(struct sockaddr_in6)),
+        "bind to %s", sockaddr2str((struct sockaddr*)&any));
+    // query socket address because it might have changed if port was 0
+    checkerr(listen(listener, LISTEN_BACKLOG), "listen on %s", local2str(listener));
+    return listener;
+}
+
+// create a socket and connect it to the IPv4 loopback address 127.0.0.1
+int connect_to_localhost(const char *port) {
+    port = port==NULL ? "23" : port; // connect to telnet port if unspecified
+    struct sockaddr_in localhost;
+    memset(&localhost, 0, sizeof(struct sockaddr_in));
+    localhost.sin_family = AF_INET;
+    localhost.sin_port = htons(parseport(port));
+    localhost.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int conn = checkerr(socket(AF_INET, SOCK_DCCP, IPPROTO_DCCP), "create DCCP socket");
+    checkerr(connect(conn, (struct sockaddr*)&localhost, sizeof(struct sockaddr_in)),
+        "connect to %s", sockaddr2str((struct sockaddr*)&localhost));
+    return conn;
+}
+
+
+/* robust socket-creation functions wrapping getaddrinfo() */
+
 // resolve an address with getaddrinfo(), calling use() for each option
-void resolve(char *addr, char *port, bool(*use)(struct addrinfo*, void*), void *context) {
+void resolve(
+        const char *addr, const char *port,
+        bool(*use)(const struct addrinfo*, int*), int *sock
+) {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family = AF_UNSPEC; // both IPv4 and IPv6
@@ -115,7 +154,7 @@ void resolve(char *addr, char *port, bool(*use)(struct addrinfo*, void*), void *
     struct addrinfo *root = ai; // need to free later
     bool succeeded = false;
     while (ai != NULL && !succeeded) {
-        succeeded = use(ai, context);
+        succeeded = use(ai, sock);
         ai = ai->ai_next;
     }
     freeaddrinfo(root);
@@ -125,111 +164,109 @@ void resolve(char *addr, char *port, bool(*use)(struct addrinfo*, void*), void *
     }
 }
 
-// callback for resolve() to create a socket and bind it to ai->ai_addr
-bool try_bind(struct addrinfo *ai, void *param) {
-    int *conn = (int*)param;
+// create a socket and bind it to ai->ai_addr
+bool try_bind(const struct addrinfo *ai, int *sock) {
     fprintf(stderr, "Trying to bind to %s\n", sockaddr2str(ai->ai_addr));
-    *conn = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (*conn == -1) {
+    *sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (*sock == -1) {
         fprintf(stderr, "Cannot create socket: %s\n", strerror(errno));
         return false;
     }
+    // enable re-binding to the address immediately after another process stopped using it
     const int yes = 1;
-    if (setsockopt(*conn, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+    if (setsockopt(*sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
         fprintf(stderr, "Cannot set SO_REUSEADDR, bind()ing anyway\n");
+    }
+    // doesn't work for some reason (neither does using uint8)
+    socklen_t int_size = sizeof(int);
+    int rx_ccid;
+    if (getsockopt(*sock, SOL_DCCP, DCCP_SOCKOPT_RX_CCID, &rx_ccid, &int_size) == 0) {
+        fprintf(stderr, "Default receive CCID: %d\n", rx_ccid);
+    } else {
+        fprintf(stderr, "Cannot get receive CCID: %s\n", strerror(errno));
+    }
+    int tx_ccid;
+    if (getsockopt(*sock, SOL_DCCP, DCCP_SOCKOPT_TX_CCID, &tx_ccid, &int_size) == 0) {
+        fprintf(stderr, "Default send CCID: %d\n", tx_ccid);
+    } else {
+        fprintf(stderr, "Cannot get send CCID: %s\n", strerror(errno));
     }
     uint8_t ccids[8];
     socklen_t num_ccids = sizeof(ccids);
-    checkerr(getsockopt(*conn, SOL_DCCP, DCCP_SOCKOPT_AVAILABLE_CCIDS, ccids, &num_ccids), "get available CCIDs");
-    for (socklen_t i=0; i<num_ccids; i++) {
-        fprintf(stderr, "OS supports CCID %d\n", (int)ccids[i]);
+    if (getsockopt(*sock, SOL_DCCP, DCCP_SOCKOPT_AVAILABLE_CCIDS, ccids, &num_ccids) == -1) {
+        fprintf(stderr, "Cannot get available CCIDs: %s\n", strerror(errno));
+    } else if (num_ccids == 0) {
+        fprintf(stderr, "OS appears to support zero CCIDs\n");
+    } else {
+        for (socklen_t i=0; i<num_ccids; i++) {
+            fprintf(stderr, "OS supports CCID %d\n", (int)ccids[i]);
+        }
+        checkerr(setsockopt(*sock, SOL_DCCP, DCCP_SOCKOPT_CCID, &ccids[0], sizeof(uint8_t)),
+            "set send & receive CCID to %d", (int)ccids[0]);
     }
-    checkerr(setsockopt(*conn, SOL_DCCP, DCCP_SOCKOPT_CCID, &ccids[0], sizeof(uint8_t)),
-        "set send & receive CCID");
-    // doesn't work for some reason (neither does using uint8)
-    // socklen_t int_size = sizeof(int);
-    // int rx_ccid;
-    // checkerr(getsockopt(*conn, SOL_DCCP, DCCP_SOCKOPT_RX_CCID, &rx_ccid, &int_size), "get receive CCID");
-    // int tx_ccid;
-    // checkerr(getsockopt(*conn, SOL_DCCP, DCCP_SOCKOPT_TX_CCID, &tx_ccid, &int_size), "get send CCID");
-    // printf("default receive CCID: %d, default send CCID: %d\n", (int)rx_ccid, (int)tx_ccid);
     int services[DCCP_SERVICE_LIST_MAX_LEN];
     for (int i=0; i<DCCP_SERVICE_LIST_MAX_LEN; i++) {
         services[i] = i;
     }
-    checkerr(setsockopt(*conn, SOL_DCCP, DCCP_SOCKOPT_SERVICE, services, sizeof(services)),
+    checkerr(setsockopt(*sock, SOL_DCCP, DCCP_SOCKOPT_SERVICE, services, sizeof(services)),
         "set %d service codes", DCCP_SERVICE_LIST_MAX_LEN);
-    if (bind(*conn, ai->ai_addr, ai->ai_addrlen) == -1) {
+    if (bind(*sock, ai->ai_addr, ai->ai_addrlen) == -1) {
         fprintf(stderr, "Cannot bind to %s: %s\n", sockaddr2str(ai->ai_addr), strerror(errno));
-        checkerr(close(*conn), "close the failed socket");
-        *conn = -1;
+        checkerr(close(*sock), "close the failed socket");
+        *sock = -1;
         return false;
     }
-    fprintf(stderr, "Local address: %s\n", local2str(*conn));
+    fprintf(stderr, "Local address: %s\n", local2str(*sock));
     return true;
 }
 
-// create a socket and listen on the address
-int listen_on(char *addr, char *port) {
-    addr = addr==NULL ? "localhost" : addr;
-    port = port==NULL ? "0" : port;
-    int sock; // try_bind() always creates a new socket
-    resolve(addr, port, try_bind, &sock);
-    checkerr(listen(sock, LISTEN_BACKLOG), "listen on %s", local2str(sock));
-    return sock;
-}
-
-// create a socket and listen on any interface (both IPv6 and IPv4) at the given port
-// without the complexity of listen_on()
-int listen_any(char *port) {
-    struct sockaddr_in6 any;
-    memset(&any, 0, sizeof(struct sockaddr_in6));
-    any.sin6_family = AF_INET6;
-    any.sin6_port = port==NULL ? 0 : htons(parseport(port));
-    any.sin6_addr = in6addr_any; // not really necessary; it's already zero
-    int sock = checkerr(socket(any.sin6_family, SOCK_DCCP, IPPROTO_DCCP), "create DCCP socket");
-    checkerr(bind(sock, (struct sockaddr*)&any, sizeof(struct sockaddr_in6)),
-        "bind to %s", sockaddr2str((struct sockaddr*)&any));
-    // query socket address because it might have changed if port was 0
-    checkerr(listen(sock, LISTEN_BACKLOG), "listen on %s", local2str(sock));
-    return sock;
-}
-
-// callback for resolve() to connect a socket to ai->ai_addr, creating a socket if it doesn't exists
-bool try_connect(struct addrinfo *ai, void *params) {
-    int *conn = (int*)params;
-    bool new_socket = *conn == -1;
+// connect a socket to ai->ai_addr, creating a socket if it doesn't exists
+bool try_connect(const struct addrinfo *ai, int *sock) {
+    bool new_socket = *sock == -1;
     fprintf(stderr, "Trying to connect to %s\n", sockaddr2str(ai->ai_addr));
     if (new_socket) {
-        *conn = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (*conn == -1) {
+        *sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (*sock == -1) {
             fprintf(stderr, "Cannot create socket: %s\n", strerror(errno));
             return false;
         }
     }
-    // int minimal_cscov = 1;
-    // checkerr(setsockopt(*conn, SOL_DCCP, DCCP_SOCKOPT_RECV_CSCOV, &minimal_cscov, sizeof(int)),
-    //     "set receive checksum-coverage filter to %d", minimal_cscov);
-    // int service_code = 9;
-    // checkerr(setsockopt(*conn, SOL_DCCP, DCCP_SOCKOPT_SERVICE, &service_code, sizeof(int)),
-    //    "set service code to %d", service_code);
-    if (connect(*conn, ai->ai_addr, ai->ai_addrlen) == -1) {
+    int minimal_cscov = 1;
+    checkerr(setsockopt(*sock, SOL_DCCP, DCCP_SOCKOPT_RECV_CSCOV, &minimal_cscov, sizeof(int)),
+        "set receive checksum-coverage filter to %d", minimal_cscov);
+    int service_code = 9;
+    checkerr(setsockopt(*sock, SOL_DCCP, DCCP_SOCKOPT_SERVICE, &service_code, sizeof(int)),
+       "set service code to %d", service_code);
+    if (connect(*sock, ai->ai_addr, ai->ai_addrlen) == -1) {
         fprintf(stderr, "Cannot connect to %s", sockaddr2str(ai->ai_addr));
         // split because sockaddr2str() reuses string buffer
-        fprintf(stderr, " (from %s): %s\n", local2str(*conn), strerror(errno));
+        fprintf(stderr, " (from %s): %s\n", local2str(*sock), strerror(errno));
         if (new_socket) {
-            checkerr(close(*conn), "close the failed socket");
-            *conn = -1;
+            checkerr(close(*sock), "close the failed socket");
+            *sock = -1;
         }
         return false;
     }
     return true;
 }
 
-// connect to domain:port, and bind to ip:port
-int connect_from_to(char *from_ip, char *from_port, char *to_domain, char *to_port) {
+// create a socket and listen on the address
+int listen_on(const char *addr, const char *port) {
+    addr = addr==NULL ? "localhost" : addr;
+    port = port==NULL ? "0" : port;
+    int listener; // try_bind() always creates a new socket
+    resolve(addr, port, try_bind, &listener);
+    checkerr(listen(listener, LISTEN_BACKLOG), "listen on %s", local2str(listener));
+    return listener;
+}
+
+// connect to domain:port after binding to ip:port
+int connect_from_to(
+        const char *from_ip, const char *from_port,
+        const char *to_domain, const char *to_port
+) {
     from_port = from_port==NULL ? "0" : from_port;
-    to_port = to_port==NULL ? "23" : to_port;
+    to_port = to_port==NULL ? "23" : to_port; // connect to telnet port if unspecified
     int conn; // try_bind() always creates a new socket
     resolve(from_ip, from_port, try_bind, &conn);
     resolve(to_domain, to_port, try_connect, &conn);
@@ -237,127 +274,141 @@ int connect_from_to(char *from_ip, char *from_port, char *to_domain, char *to_po
 }
 
 // connect to domain:port without binding
-int connect_to(char *domain, char *port) {
+int connect_to(const char *domain, const char *port) {
     domain = domain==NULL ? "localhost" : domain;
-    port = port==NULL ? "23" : port;
+    port = port==NULL ? "23" : port; // connect to telnet port if unspecified
     int conn = -1; // tells try_connect() to also create a socket
     resolve(domain, port, try_connect, &conn);
     return conn;
 }
 
-// connect to the IPv4 loopback 127.0.0.1,
-// without the complexity of connect_to()
-int connect_to_localhost(char *port) {
-    port = port==NULL ? "23" : port;
-    struct sockaddr_in localhost;
-    memset(&localhost, 0, sizeof(struct sockaddr_in));
-    localhost.sin_family = AF_INET;
-    localhost.sin_port = htons(parseport(port));
-    localhost.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int conn = checkerr(socket(AF_INET, SOCK_DCCP, IPPROTO_DCCP), "create DCCP socket");
-    checkerr(connect(conn, (struct sockaddr*)&localhost, sizeof(struct sockaddr_in)),
-        "connect to %s", sockaddr2str((struct sockaddr*)&localhost));
-    return conn;
-}
 
-void accept_loop(int sd, ssize_t(*perform)(int, struct sockaddr_in6*, void*), void* param) {
-    struct sockaddr_storage remote;
+/* program modes */
+
+// accept a single incoming connection at a time,
+// waiting until the client disconnects before accepting another
+void accept_loop(int listener, ssize_t(*perform)(int)) {
+    struct sockaddr_storage client;
     socklen_t addrlen = sizeof(struct sockaddr_storage);
-    while (1) {
-        int conn = checkerr(accept(sd, (struct sockaddr*)&remote, &addrlen), "accept connection");
-        char *client = sockaddr2str((struct sockaddr*)&remote);
-        printf("Accepted connection from %s\n", client);
-        int lastret = perform(conn, (struct sockaddr_in6*)&remote, param);
-        if (lastret == -1) {
-            fprintf(stderr, "Error with %s: %s\n", client, strerror(errno));
+    while (true) {
+        int conn = checkerr(accept(listener, (struct sockaddr*)&client, &addrlen),
+            "accept connection");
+        char *client_str = sockaddr2str((struct sockaddr*)&client);
+        fprintf(stderr, "Accepted connection from %s\n", client_str);
+        int lastret = perform(conn);
+        if (lastret == -1 && errno != EPIPE) {
+            fprintf(stderr, "Error with %s: %s\n", client_str, strerror(errno));
         } else {
-            printf("Closed by remote\n");
+            fprintf(stderr, "Closed by client\n");
         }
-        checkerr(close(conn), "close connection to %s", client);
+        checkerr(close(conn), "close connection to %s", client_str);
     }
 }
 
 // call perform() then close() the socket
-void client(int conn, ssize_t(*perform)(int, struct sockaddr_in6*, void*), void* param) {
+void client(int conn, ssize_t(*perform)(int)) {
     fprintf(stderr, "Connected, from %s\n", local2str(conn));
-    ssize_t lastret = perform(conn, NULL, param);
-    if (lastret == -1) {
+    ssize_t lastret = perform(conn);
+    if (lastret == -1 && errno != EPIPE) {
         fprintf(stderr, "Error: %s\n", strerror(errno));
     } else {
-        printf("Closed by remote\n");
+        fprintf(stderr, "Closed by server\n");
     }
     checkerr(close(conn), "close connection");
 }
 
-// send the received data back to the sender
-ssize_t echo(int conn, struct sockaddr_in6 *_remote, void *_nothing) {
-    UNUSED(_remote);
-    UNUSED(_nothing);
-    char buf[1024];
-    while (1) {
-        ssize_t received = recv(conn, &buf, sizeof(buf), MSG_TRUNC);
+// send the received data back to the sender and to stdout
+ssize_t echo(int conn) {
+    char buf[BUFFER_SIZE];
+    while (true) {
+        ssize_t received = recv(conn, &buf, sizeof(buf), MSG_NOSIGNAL | MSG_TRUNC);
         if (received <= 0) {
+            // receiving zero bytes can both mean an empty message and end of connection,
+            // and there doesn't seem to be a way to tell them apart.
+            // Treat it as end of connection to avoid an infinite loop.
             return received;
         }
-        size_t stored = (size_t)received <= sizeof(buf) ? (size_t)received : sizeof(buf);
-        checkerr(fwrite(&buf, stored, 1, stdout), "write to stdout");
-        ssize_t sent = send(conn, buf, stored, MSG_CONFIRM);
-        checkerr((int)sent, "Error sending %d bytes to %s: %s\n", stored, client, strerror(errno));
+        if ((size_t)received > sizeof(buf)) {
+            fprintf(stderr, "Could only store %zd of %zd bytes of client's datagram\n",
+                sizeof(buf), received);
+            received = sizeof(int);
+        }
+        checkerr(fwrite(&buf, received, 1, stdout), "write to stdout");
+        ssize_t sent = send(conn, &buf, received, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            return sent;
+        }
     }
 }
 
-// used to restore nonblocking-ness on exit, see talk_rasync()
-int initial_stdin_flags; // is initialized by talk_rasync() before use
+#define STDIN 0
+#define STDOUT 1
+
+// used to restore nonblocking-ness on exit
+// is inititalized by make_stdin_nonblocking() if used
+int original_stdin_flags;
 
 void restore_stdin_flags() {
-    fcntl(STDIN, F_SETFL, initial_stdin_flags);
+    fcntl(STDIN, F_SETFL, original_stdin_flags);
     // ignore any error; program is terminating already and printf() isn't signal-safe
 }
 
-void handler(int signal) {
+void signal_handler(int signal) {
     restore_stdin_flags();
     raise(signal); // continue to default handler (this handler was registered as oneshot)
 }
 
-// send stdin to socket and socket to stdout, using select() to avoid blocking on either side.
-ssize_t talk_rasync(int conn, struct sockaddr_in6 *_remote, void *_param) {
-    UNUSED(_remote);
-    UNUSED(_param);
+// set stdin to nonblocking mode and register functions to restore it at program exit
+void make_stdin_nonblocking() {
     // set stdin to nonblocking mode unless it's a file
     // (because it would then never make progress on Linux)
     struct stat stdinfo;
-    checkerr(fstat(STDIN, &stdinfo), "stat() stdin");
-    // not sure about block devices, so treat it as file just in case
-    if ((stdinfo.st_mode & S_IFMT) != S_IFREG && (stdinfo.st_mode & S_IFMT) != S_IFBLK) {
-        initial_stdin_flags = checkerr(fcntl(STDIN, F_GETFL, 0), "get flags for stdin");
-        checkerr(fcntl(STDIN, F_SETFL, initial_stdin_flags | O_NONBLOCK), "make stdin nonblocking");
+    checkerr(fstat(STDIN, &stdinfo), "stat stdin");
+    if ((stdinfo.st_mode & S_IFMT) != S_IFREG) {
+        original_stdin_flags = checkerr(fcntl(STDIN, F_GETFL, 0), "get flags for stdin");
+        checkerr(fcntl(STDIN, F_SETFL, original_stdin_flags | O_NONBLOCK),
+            "make stdin nonblocking");
         // restore blockingness on exit, otherwise `git add -p` and other commands stop working
         // afterwards. (The `reset` command doesn't restore this either, but invoking `bash` then
         // exiting fixes it).
         atexit(restore_stdin_flags);
         struct sigaction act;
         sigemptyset(&act.sa_mask);
-        act.sa_handler = handler;
+        act.sa_handler = signal_handler;
         act.sa_flags = SA_RESETHAND; // resume with default handler after restoring
         sigaction(SIGINT, &act, NULL);
         sigaction(SIGTERM, &act, NULL);
     }
+}
+
+// send stdin to socket and socket to stdout using select() to avoid blocking on either side,
+// and disconnect when peer has nothing more to send.
+ssize_t interactive_async_read(int conn) {
+    make_stdin_nonblocking();
     int max_packet_size;
     socklen_t int_size = sizeof(int);
     checkerr(getsockopt(conn, SOL_DCCP, DCCP_SOCKOPT_GET_CUR_MPS, &max_packet_size, &int_size),
         "get max packet size");
     fprintf(stderr, "maximum packet size: %d\n", max_packet_size);
-    char buf[4096];
+    char buf[BUFFER_SIZE];
     ssize_t received;
-    // main loop; runs until either stdin reaches EOF or remote disconnects
-    while (1) {
+    // main loop; runs until either stdin reaches EOF or peer disconnects
+    while (true) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(STDIN, &readfds);
         FD_SET(conn, &readfds);
         fd_set errfds = readfds;
         checkerr(select(conn+1, &readfds, NULL, &errfds, NULL), "select()");
-        while ((received = recv(conn, &buf, sizeof(buf), MSG_DONTWAIT)) > 0) {
+        // receiving zero bytes can both mean an empty message and end of connection,
+        // and there doesn't seem to be a way to tell them apart.
+        // Treat it as end of connection to avoid an infinite loop.
+        while ((received = recv(conn, &buf, sizeof(buf), MSG_NOSIGNAL | MSG_TRUNC | MSG_DONTWAIT)) > 0) {
+            if ((size_t)received > sizeof(buf)) {
+                fprintf(stderr, "Could only store %zd of %zd bytes of client's datagram\n",
+                    sizeof(buf), received);
+                received = sizeof(buf);
+            }
             checkerr(fwrite(&buf, received, 1, stdout), "write to stdout");
         }
         if (received == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -365,14 +416,11 @@ ssize_t talk_rasync(int conn, struct sockaddr_in6 *_remote, void *_param) {
         }
         ssize_t to_send;
         while ((to_send = read(STDIN, &buf, sizeof(buf))) > 0) {
-            ssize_t sent = 0;
-            while (sent < to_send) {
-                ssize_t this_send = send(conn, &buf[sent], to_send-sent, 0);
-                if (this_send <= 0) {
-                    return this_send;
-                }
-                sent += this_send;
+            ssize_t sent = send(conn, &buf, to_send, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                return sent;
             }
+            // fails with EMSGSIZE if not all can be sent at once
         }
         if (to_send == 0) {
             break;
@@ -380,32 +428,30 @@ ssize_t talk_rasync(int conn, struct sockaddr_in6 *_remote, void *_param) {
             return to_send;
         }
     }
-    // nothing more to send, but wait for response
-    if (shutdown(conn, SHUT_WR) == -1) {
-        fprintf(stderr, "Cannot shutdown send side: %s\n", strerror(errno));
+    // nothing more to send, SHUT_WR has no effect so shutdown both directions
+    if (shutdown(conn, SHUT_RDWR) == -1) {
+        fprintf(stderr, "Cannot shutdown connection: %s\n", strerror(errno));
         // don't exit()
     }
-    while ((received = recv(conn, &buf, sizeof(buf), 0/*do wait now*/)) > 0) {
-        checkerr(fwrite(&buf, received, 1, stdout), "write to stdout");
-    }
-    return received;
+    return 0;
 }
+
 
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "listen")) {
-        accept_loop(listen_any(argv[2]), talk_rasync, NULL);
+        accept_loop(listen_any(argv[2]), interactive_async_read);
     } else if (argc == 4 && !strcmp(argv[1], "listen")) {
-        accept_loop(listen_on(argv[2], argv[3]), talk_rasync, NULL);
+        accept_loop(listen_on(argv[2], argv[3]), interactive_async_read);
     } else if (argc == 3 && !strcmp(argv[1], "echo")) {
-        accept_loop(listen_any(argv[2]), echo, NULL);
+        accept_loop(listen_any(argv[2]), echo);
     } else if (argc == 4 && !strcmp(argv[1], "echo")) {
-        accept_loop(listen_on(argv[2], argv[3]), echo, NULL);
+        accept_loop(listen_on(argv[2], argv[3]), echo);
     } else if (argc == 2) {
-        client(connect_to_localhost(argv[1]), talk_rasync, NULL);
+        client(connect_to_localhost(argv[1]), interactive_async_read);
     } else if (argc == 3) {
-        client(connect_to(argv[1], argv[2]), talk_rasync, NULL);
+        client(connect_to(argv[1], argv[2]), interactive_async_read);
     } else if (argc == 5) {
-        client(connect_from_to(argv[1], argv[2], argv[3], argv[4]), talk_rasync, NULL);
+        client(connect_from_to(argv[1], argv[2], argv[3], argv[4]), interactive_async_read);
     } else {
         fprintf(stderr, "Usage:\n");
         fprintf(stderr, "\tdccp [[source_addr source_port] domain] port - select()-based client\n");
@@ -415,3 +461,10 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+
+// Things this program doesn't do, but code that wants to be robust should consider:
+// * Retry accept() if it fails with ECONNABORTED, ECONNRESET, ECONNREFUSED.
+// * Retry reads, writes, connect(), select() and accept() if they fail with EINTR.
+// * Avoid using global variables, or at least make them thread-local.
+// * Set CLOEXEC on created sockets. (using SOCK_CLOEXEC and accept4() where available)
+// * Fall back to another protocol if creating socket fails or connections cannot be established.

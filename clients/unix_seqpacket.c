@@ -1,4 +1,4 @@
-// A simple AF_UNIX SOCK_STREAM client and server that can transfer FDs and credentials.
+// A simple AF_UNIX SOCK_SEQPACKET client and server that can transfer FDs and credentials.
 
 #define _POSIX_C_SOURCE 200809L // 2008.09 needed for SA_RESETHAND and the S_IF* fd types
 #define _GNU_SOURCE // needed for struct ucred definition
@@ -121,7 +121,7 @@ socklen_t addr_from_name(const char *name, struct sockaddr_un *addr) {
 
 // bind() to from if not NULL and connect() to to if not NULL
 int name_from_to(const char *from, const char *to) {
-    int sock = checkerr(socket(AF_UNIX, SOCK_STREAM, 0), "create unix stream socket");
+    int sock = checkerr(socket(AF_UNIX, SOCK_SEQPACKET, 0), "create unix seqpacket socket");
     struct sockaddr_un addr;
     if (from != NULL) {
         socklen_t size = addr_from_name(from, &addr);
@@ -139,7 +139,7 @@ int name_from_to(const char *from, const char *to) {
 
 // create a socket and listen on the address
 int listen_on(const char *name) {
-    name = name==NULL ? "stream.socket" : name;
+    name = name==NULL ? "seqpacket.socket" : name;
     int listener = name_from_to(name, NULL);
     // query socket address because I don't know if it can change
     checkerr(listen(listener, LISTEN_BACKLOG), "listen on %s", name);
@@ -149,7 +149,7 @@ int listen_on(const char *name) {
 
 /* functions for sending and receiving */
 
-// print pid, uid and gid of the other end of a stream
+// print pid, uid and gid of the other end of a connection
 void peercreds(int conn) {
     struct ucred peer = {.pid=0};
     socklen_t ucred_size = sizeof(struct ucred);
@@ -208,6 +208,7 @@ ssize_t send_ancillary(
             memcpy((int*)CMSG_DATA(control), fds, num_fds*sizeof(int));
         }
     }
+    // MSG_EOR is not used by unix domain SOCK_SEQPACKET
     ssize_t sent = sendmsg(conn, &msg, MSG_NOSIGNAL);
     if (msg.msg_control != NULL) {
         free(msg.msg_control);
@@ -240,7 +241,7 @@ ssize_t recv_ancillary(
         .msg_controllen = 1024,
         .msg_flags = 0 // unused, but just in case
     };
-    ssize_t content_bytes = recvmsg(conn, &msg, MSG_NOSIGNAL | MSG_CMSG_CLOEXEC);
+    ssize_t content_bytes = recvmsg(conn, &msg, MSG_NOSIGNAL | MSG_TRUNC | MSG_CMSG_CLOEXEC);
     int num_creds = 0;
     int num_fds = 0;
     for (struct cmsghdr *control=CMSG_FIRSTHDR(&msg); control != NULL; control = CMSG_NXTHDR(&msg, control)) {
@@ -319,6 +320,9 @@ ssize_t echo(int conn) {
         int *fds;
         ssize_t received = recv_ancillary(conn, buf, sizeof(buf), &peer_creds, &fds);
         if (received <= 0) {
+            // receiving zero bytes can both mean an empty message and end of connection,
+            // and there doesn't seem to be a way to tell them apart.
+            // Treat it as end of connection to avoid an infinite loop.
             return received;
         }
         if (peer_creds.pid != 0) {
@@ -328,14 +332,15 @@ ssize_t echo(int conn) {
             printf("Received fd %d\n", *fds);
             close(*fds);
         }
+        if ((size_t)received > sizeof(buf)) {
+            printf("Could only store %zd of %zd bytes of peers message\n",
+                sizeof(buf), received);
+            received = sizeof(buf);
+        }
         checkerr(fwrite(&buf, received, 1, stdout), "write to stdout");
-        ssize_t sent = 0;
-        while (sent < received) {
-            ssize_t this_send = send(conn, &buf[sent], received-sent, MSG_NOSIGNAL);
-            if (this_send <= 0) {
-                return this_send;
-            }
-            sent += this_send;
+        ssize_t sent = send(conn, buf, received, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            return sent;
         }
     }
 }
@@ -394,7 +399,15 @@ ssize_t interactive_async_read(int conn) {
         FD_SET(conn, &readfds);
         fd_set errfds = readfds;
         checkerr(select(conn+1, &readfds, NULL, &errfds, NULL), "select()");
+        // receiving zero bytes can both mean an empty message and end of connection,
+        // and there doesn't seem to be a way to tell them apart.
+        // Treat it as end of connection to avoid an infinite loop.
         while ((received = recv(conn, &buf, sizeof(buf), MSG_NOSIGNAL | MSG_DONTWAIT)) > 0) {
+            if ((size_t)received > sizeof(buf)) {
+                fprintf(stderr, "Could only store %zd of %zd bytes of peer's message\n",
+                    sizeof(buf), received);
+                received = sizeof(buf);
+            }
             checkerr(fwrite(&buf, received, 1, stdout), "write to stdout");
         }
         if (received == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -402,14 +415,11 @@ ssize_t interactive_async_read(int conn) {
         }
         ssize_t to_send;
         while ((to_send = read(STDIN, &buf, sizeof(buf))) > 0) {
-            ssize_t sent = 0;
-            while (sent < to_send) {
-                ssize_t this_send = send(conn, &buf[sent], to_send-sent, MSG_NOSIGNAL);
-                if (this_send <= 0) {
-                    return this_send;
-                }
-                sent += this_send;
+            ssize_t sent = send(conn, buf, to_send, MSG_NOSIGNAL);
+            if (sent <= 0) {
+                return sent;
             }
+            // fails with EMSGSIZE if message is too big
         }
         if (to_send == 0) {
             break;
@@ -479,13 +489,13 @@ int main(int argc, char **argv) {
     } else if (argc == 2) {
         client(name_from_to(NULL, argv[1]), interactive_async_read);
     } else {
-        fprintf(stderr, "unix stream socket client and server\n");
+        fprintf(stderr, "unix seqpacket socket client and server\n");
         fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "\tunix_stream [source] path - select()-based client\n");
-        fprintf(stderr, "\tunix_stream listen path - select()-based server\n");
-        fprintf(stderr, "\tunix_stream echo path - echo server\n");
-        fprintf(stderr, "\tunix_stream fdpass [source] path - exchange stdins and read from received fd\n");
-        fprintf(stderr, "\tunix_stream listen_fdpass path - exchange stdins and read from received fd\n");
+        fprintf(stderr, "\tunix_seqpacket [source] path - select()-based client\n");
+        fprintf(stderr, "\tunix_seqpacket listen path - select()-based server\n");
+        fprintf(stderr, "\tunix_seqpacket echo path - echo server\n");
+        fprintf(stderr, "\tunix_seqpacket fdpass [source] path - exchange stdins and read from received fd\n");
+        fprintf(stderr, "\tunix_seqpacket listen_fdpass path - exchange stdins and read from received fd\n");
         exit(1);
     }
     return 0;

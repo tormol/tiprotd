@@ -1,4 +1,4 @@
-// A simple TCP client and server sporting some async features.
+// A barebones SCTP client and server, with minimal differences from tcp.c
 
 #define _POSIX_C_SOURCE 200809L // 2008.09 needed for SA_RESETHAND and the S_IF* fd types
 #include <sys/socket.h> // socket(), struct sockaddr, ...
@@ -19,7 +19,7 @@
 #include <stdbool.h>
 
 #define BUFFER_SIZE 4096
-#define LISTEN_BACKLOG 0
+#define LISTEN_BACKLOG 1
 
 
 /* helper functions */
@@ -106,7 +106,8 @@ int listen_any(const char *port) {
     any.sin6_family = AF_INET6;
     any.sin6_port = port==NULL ? 0 : htons(parseport(port));
     any.sin6_addr = in6addr_any; // not really necessary; it's already zero
-    int listener = checkerr(socket(any.sin6_family, SOCK_STREAM, 0), "create TCP socket");
+    int listener = checkerr(socket(any.sin6_family, SOCK_STREAM, IPPROTO_SCTP),
+        "create SCTP socket");
     // you probably want to set SO_REUSEADDR, see try_bind() below
     checkerr(bind(listener, (struct sockaddr*)&any, sizeof(struct sockaddr_in6)),
         "bind to %s", sockaddr2str((struct sockaddr*)&any));
@@ -123,7 +124,7 @@ int connect_to_localhost(const char *port) {
     localhost.sin_family = AF_INET;
     localhost.sin_port = htons(parseport(port));
     localhost.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    int conn = checkerr(socket(AF_INET, SOCK_STREAM, 0), "create TCP socket");
+    int conn = checkerr(socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP), "create SCTP socket");
     checkerr(connect(conn, (struct sockaddr*)&localhost, sizeof(struct sockaddr_in)),
         "connect to %s", sockaddr2str((struct sockaddr*)&localhost));
     return conn;
@@ -141,6 +142,7 @@ void resolve(
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family = AF_UNSPEC; // both IPv4 and IPv6
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_SCTP;
     struct addrinfo *ai;
     int gai_ret = getaddrinfo(addr, port, &hints, &ai);
     // for some reason, getaddrinfo uses a different set of error codes
@@ -298,9 +300,8 @@ ssize_t echo(int conn) {
 #define STDIN 0
 #define STDOUT 1
 
-// used to restore nonblocking-ness on exit
-// is inititalized by make_stdin_nonblocking() if used
-int original_stdin_flags;
+// used to restore nonblocking-ness on exit, see interactive_async_read()
+int original_stdin_flags; // is initialized by interactive_async_read() before use
 
 void restore_stdin_flags() {
     fcntl(STDIN, F_SETFL, original_stdin_flags);
@@ -312,13 +313,15 @@ void signal_handler(int signal) {
     raise(signal); // continue to default handler (this handler was registered as oneshot)
 }
 
-// set stdin to nonblocking mode and register functions to restore it at program exit
-void make_stdin_nonblocking() {
+// send stdin to socket and socket to stdout using select() to avoid blocking on either side,
+// and disconnect when peer has nothing more to send.
+ssize_t interactive_async_read(int conn) {
     // set stdin to nonblocking mode unless it's a file
     // (because it would then never make progress on Linux)
     struct stat stdinfo;
-    checkerr(fstat(STDIN, &stdinfo), "stat stdin");
-    if ((stdinfo.st_mode & S_IFMT) != S_IFREG) {
+    checkerr(fstat(STDIN, &stdinfo), "stat() stdin");
+    // not sure about block devices, so treat it as file just in case
+    if ((stdinfo.st_mode & S_IFMT) != S_IFREG && (stdinfo.st_mode & S_IFMT) != S_IFBLK) {
         original_stdin_flags = checkerr(fcntl(STDIN, F_GETFL, 0), "get flags for stdin");
         checkerr(fcntl(STDIN, F_SETFL, original_stdin_flags | O_NONBLOCK),
             "make stdin nonblocking");
@@ -333,12 +336,6 @@ void make_stdin_nonblocking() {
         sigaction(SIGINT, &act, NULL);
         sigaction(SIGTERM, &act, NULL);
     }
-}
-
-// send stdin to socket and socket to stdout using select() to avoid blocking on either side,
-// and disconnect when peer has nothing more to send.
-ssize_t interactive_async_read(int conn) {
-    make_stdin_nonblocking();
     char buf[BUFFER_SIZE];
     ssize_t received;
     // main loop; runs until either stdin reaches EOF or peer disconnects
@@ -401,16 +398,23 @@ int main(int argc, char **argv) {
         client(connect_from_to(argv[1], argv[2], argv[3], argv[4]), interactive_async_read);
     } else {
         fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "\ttcp [[source_addr source_port] domain] port - select()-based client\n");
-        fprintf(stderr, "\ttcp listen [addr] port - select()-based server\n");
-        fprintf(stderr, "\ttcp echo [addr] port - echo server\n");
+        fprintf(stderr, "\tsctp1 [[source_addr source_port] domain] port - select()-based client\n");
+        fprintf(stderr, "\tsctp1 listen [addr] port - select()-based server\n");
+        fprintf(stderr, "\tsctp1 echo [addr] port - echo server\n");
         exit(1);
     }
     return 0;
 }
 
-// Things this program doesn't do (for simplicity), but code that wants to be robust should consider:
-// * Retry accept() if it fails with ECONNABORTED, ECONNRESET or ECONNREFUSED.
+// This program mostly serves to test that SCTP works, with minimal differences from tcp.c.
+// Things this program doesn't do:
+// * Take advantage of SCTP being message-based, and remove code for handling short writes.
+// * pass MSG_TRUNC to get real message length if too big for buffer.
+// * Support multiple channels.
+// * Use multi-homing.
+// * Use SOCK_SEQPACKET mode for echo.
+// * Retry accept() if it fails with ECONNABORTED, ECONNRESET, ECONNREFUSED.
 // * Retry reads, writes, connect(), select() and accept() if they fail with EINTR.
 // * Avoid using global variables, or at least make them thread-local.
 // * Set CLOEXEC on created sockets. (using SOCK_CLOEXEC and accept4() where available)
+// * Fall back to TCP if creating socket fails or connections cannot be established.
