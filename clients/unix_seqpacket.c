@@ -402,7 +402,8 @@ ssize_t interactive_async_read(int conn) {
         // receiving zero bytes can both mean an empty message and end of connection,
         // and there doesn't seem to be a way to tell them apart.
         // Treat it as end of connection to avoid an infinite loop.
-        while ((received = recv(conn, &buf, sizeof(buf), MSG_NOSIGNAL | MSG_DONTWAIT)) > 0) {
+        int flags = MSG_NOSIGNAL | MSG_TRUNC | MSG_DONTWAIT;
+        while ((received = recv(conn, &buf, sizeof(buf), flags)) > 0) {
             if ((size_t)received > sizeof(buf)) {
                 fprintf(stderr, "Could only store %zd of %zd bytes of peer's message\n",
                     sizeof(buf), received);

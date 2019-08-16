@@ -86,7 +86,7 @@ mqd_t parseopts_open(char* qname, char* qopts) {
         }
         qopts++;
     }
-    
+
     char* numstarts[3] = {NULL, NULL, NULL};
     int nums = 0;
     int in_num = 0;

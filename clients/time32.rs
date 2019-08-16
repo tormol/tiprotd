@@ -5,6 +5,8 @@ use std::env::args_os;
 use std::str::FromStr;
 use std::net::{TcpStream, UdpSocket};
 use std::io::{Error, Read, stdin};
+#[cfg(unix)]
+use std::os::unix::net::{UnixDatagram, UnixStream};
 
 fn timestamp_to_date(mut ts: i32) -> [u16; 6] {
     // std::time cannot format, and this is not worth pulling in chrono for
