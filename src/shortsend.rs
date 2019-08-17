@@ -1,6 +1,9 @@
 use std::collections::HashSet;
-use std::io::{ErrorKind, Write};
+use std::fs::File;
+use std::io::{ErrorKind, Write, BufRead, BufReader};
 use std::net::SocketAddr;
+use std::path::Path;
+use std::rc::Rc;
 use std::time::SystemTime;
 #[cfg(unix)]
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
@@ -9,6 +12,7 @@ use mio::{Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
+use rand::seq::SliceRandom;
 
 use crate::Server;
 use crate::ServiceSocket;
@@ -166,68 +170,180 @@ fn unix_datagram_shortsend(
 
 
 const QOTD_PORT: u16 = 17;
-const QOTD: &[u8] = b"No quote today, the DB has gone away\n";
+const QOTD_FILE: &str = "quotes.txt";
+const FALLBACK_QOTD: &[u8] = b"No quote today, the DB has gone away\n";
+
+type QuoteDb = Rc<[Box<[u8]>]>;
 
 pub enum QotdSocket {
-    TcpListener(TcpListener),
-    Udp(UdpSocket, HashSet<SocketAddr>),
+    TcpListener(TcpListener, QuoteDb, u32),
+    Udp(UdpSocket, HashSet<SocketAddr>, QuoteDb, u32),
     #[cfg(unix)]
-    UnixStreamListener(UnixSocketWrapper<UnixListener>),
+    UnixStreamListener(UnixSocketWrapper<UnixListener>, QuoteDb, u32),
     #[cfg(unix)]
-    UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>), // doesn't implement Hash
+    UnixDatagram(
+        UnixSocketWrapper<UnixDatagram>,
+        Box<(Vec<UnixSocketAddr>/*doesn't implement Hash*/, QuoteDb, u32)>
+    ),
     #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-    PosixMq(PosixMqWrapper),
+    PosixMq(PosixMqWrapper, QuoteDb, u32),
+}
+
+/// read file, split by lines matching /---+\s*/ and shuffle
+fn read_qotes(path: &Path) -> QuoteDb {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            if e.kind() == ErrorKind::NotFound {
+                eprintln!("No QOTD file {:?}. Seending fallback quote instead", path);
+            } else {
+                eprintln!("Cannot read {:?}: {}. Sending fallback quote instead", path, e);
+            }
+            return Rc::from(vec![Box::from(FALLBACK_QOTD)]);
+        }
+    };
+    let mut quotes = Vec::new();
+    let mut buf = Vec::with_capacity(256);
+    let mut reader = BufReader::new(file);
+    loop {
+        match reader.read_until(b'\n', &mut buf) {
+            Err(ref e) if quotes.is_empty() => {
+                eprintln!("Error reading {:?}: {}. Sending fallback quote instead.", path, e);
+                return Rc::from(vec![Box::from(FALLBACK_QOTD)]);
+            }
+            Err(e) => {
+                eprintln!("Error while reading {:?}: {}. Using {} quote(s) successfully read.",
+                    path, e, quotes.len()
+                );
+                buf.clear(); // discard potentially half read quote
+                break;
+            }
+            Ok(0) => break,
+            Ok(n) => {
+                let line_start = buf.len() - n;
+                // remove trailing whitespace and normalize line endings
+                // (or lack of a trailing one)
+                let trailing_whitespace = buf[line_start..].iter()
+                    .rev()
+                    .take_while(|&&c| c.is_ascii_whitespace() )
+                    .count();
+                buf.truncate(buf.len()-trailing_whitespace);
+                buf.push(b'\n');
+                // check if buf ends with separator
+                let not_whitespace = &buf[line_start..buf.len()-1];
+                if not_whitespace.len() >= 3  &&  not_whitespace.iter().all(|&c| c == b'-' ) {
+                    quotes.push(Box::from(&buf[..line_start]));
+                    buf.clear();
+                }
+            }
+        }
+    }
+    if buf.len() > 0 {
+        quotes.push(buf.into_boxed_slice());
+    }
+    if quotes.is_empty() {
+        eprintln!("No quotes in {:?}, Sending fallback quote instead", path);
+        return Rc::from(vec![Box::from(FALLBACK_QOTD)]);
+    }
+    quotes.shuffle(&mut rand::thread_rng());
+    Rc::from(quotes)
 }
 
 impl QotdSocket {
     pub fn setup(server: &mut Server) {
-        listen_tcp(server, "qotd", QOTD_PORT,
-            &mut|listener, Token(_)| ServiceSocket::Qotd(QotdSocket::TcpListener(listener))
-        );
+        let quotes = read_qotes(QOTD_FILE.as_ref());
+        listen_tcp(server, "qotd", QOTD_PORT, &mut|listener, Token(_)| {
+            ServiceSocket::Qotd(QotdSocket::TcpListener(listener, quotes.clone(), 0))
+        });
         listen_udp(server, "qotd", QOTD_PORT, Ready::readable() | Ready::writable(),
-            &mut|socket, Token(_)| ServiceSocket::Qotd(QotdSocket::Udp(socket, HashSet::new()))
+            &mut|socket, Token(_)| {
+                ServiceSocket::Qotd(QotdSocket::Udp(socket, HashSet::new(), quotes.clone(), 0))
+            }
         );
         #[cfg(unix)]
-        UnixSocketWrapper::create_stream_listener("qotd", server,
-            |listener| ServiceSocket::Qotd(QotdSocket::UnixStreamListener(listener))
-        );
+        UnixSocketWrapper::create_stream_listener("qotd", server, &mut|listener, Token(_)| {
+            ServiceSocket::Qotd(QotdSocket::UnixStreamListener(listener, quotes.clone(), 0))
+        });
         #[cfg(unix)]
         UnixSocketWrapper::create_datagram_socket("qotd", Ready::all(), server,
-            |socket| ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, Vec::new()))
+            &mut|socket, Token(_)| {
+                let state = Box::new((Vec::new(), quotes.clone(), 0));
+                ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, state))
+            }
         );
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
         listen_posixmq(server, "qotd", Ready::writable(),
-            posixmq::OpenOptions::writeonly().mode(0o644).max_msg_len(QOTD.len()).capacity(1),
-            &mut|mq, Token(_)| ServiceSocket::Qotd(QotdSocket::PosixMq(mq))
+            posixmq::OpenOptions::writeonly()
+                .mode(0o644)
+                .max_msg_len(quotes.iter().map(|quote| quote.len() ).max().unwrap_or(0))
+                .capacity(1),
+            &mut|mq, Token(_)| ServiceSocket::Qotd(QotdSocket::PosixMq(mq, quotes.clone(), 0))
         );
     }
 
     pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
         match self {
-            &mut QotdSocket::TcpListener(ref listener) => {
-                tcp_shortsend_accept_loop(listener, server, &"qotd", QOTD)
+            &mut QotdSocket::TcpListener(ref listener, ref quotes, ref mut pos) => {
+                let status = tcp_shortsend_accept_loop(
+                        listener,
+                        server,
+                        &"qotd",
+                        &quotes[*pos as usize]
+                );
+                *pos += 1;
+                *pos %= quotes.len() as u32;
+                status
             }
             #[cfg(unix)]
-            &mut QotdSocket::UnixStreamListener(ref listener) => {
-                unix_stream_shortsend_accept_loop(listener, server, &"qotd", QOTD)
+            &mut QotdSocket::UnixStreamListener(ref listener, ref quotes, ref mut pos) => {
+                let status = unix_stream_shortsend_accept_loop(
+                        listener,
+                        server,
+                        &"qotd",
+                        &quotes[*pos as usize]
+                );
+                *pos += 1;
+                *pos %= quotes.len() as u32;
+                status
             }
-            &mut QotdSocket::Udp(ref socket, ref mut outstanding) => {
-                udp_shortsend(socket, server, "qotd", readiness, outstanding, QOTD)
+            &mut QotdSocket::Udp(ref socket, ref mut outstanding, ref quotes, ref mut pos) => {
+                let status = udp_shortsend(
+                        socket,
+                        server,
+                        "qotd",
+                        readiness,
+                        outstanding,
+                        &quotes[*pos as usize]
+                );
+                *pos += 1;
+                *pos %= quotes.len() as u32;
+                status
             }
             #[cfg(unix)]
-            &mut QotdSocket::UnixDatagram(ref socket, ref mut outstanding) => {
-                unix_datagram_shortsend(socket, "qotd", readiness, outstanding, QOTD)
+            &mut QotdSocket::UnixDatagram(ref socket, ref mut boxed) => {
+                let tuple: &mut(_, _, _) = &mut*boxed;
+                let &mut(ref mut outstanding, ref quotes, ref mut pos) = tuple;
+                let status = unix_datagram_shortsend(
+                        socket,
+                        "qotd",
+                        readiness,
+                        outstanding,
+                        &quotes[*pos as usize]
+                );
+                *pos += 1;
+                *pos %= quotes.len() as u32;
+                status
             }
             #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-            &mut QotdSocket::PosixMq(ref mq) => {
+            &mut QotdSocket::PosixMq(ref mq, ref quotes, ref mut pos) => {
                 loop {
-                    match mq.send(0, QOTD) {
+                    match mq.send(0, &quotes[*pos as usize]) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break Drained,
                         Err(e) => {
                             eprintln!("Error sending to posix message queue /qotd: {}, removing it.", e);
                             break Remove;
                         }
-                        Ok(()) => {}
+                        Ok(()) => *pos = (*pos+1) % quotes.len() as u32
                     }
                 }
             }
@@ -236,14 +352,14 @@ impl QotdSocket {
 
     pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
         match self {
-            &QotdSocket::TcpListener(ref listener) => Some(listener),
-            &QotdSocket::Udp(ref socket, _) => Some(socket),
+            &QotdSocket::TcpListener(ref listener, _, _) => Some(listener),
+            &QotdSocket::Udp(ref socket, _, _, _) => Some(socket),
             #[cfg(unix)]
-            &QotdSocket::UnixStreamListener(ref listener) => Some(&**listener),
+            &QotdSocket::UnixStreamListener(ref listener, _, _) => Some(&**listener),
             #[cfg(unix)]
             &QotdSocket::UnixDatagram(ref socket, _) => Some(&**socket),
             #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
-            &QotdSocket::PosixMq(ref mq) => Some(&**mq),
+            &QotdSocket::PosixMq(ref mq, _, _) => Some(&**mq),
         }
     }
 }
@@ -298,12 +414,14 @@ impl Time32Socket {
             &mut|socket, Token(_)| ServiceSocket::Time32(Time32Socket::Udp(socket, HashSet::new()))
         );
         #[cfg(unix)]
-        UnixSocketWrapper::create_stream_listener("time32", server,
-            |listener| ServiceSocket::Time32(Time32Socket::UnixStreamListener(listener))
-        );
+        UnixSocketWrapper::create_stream_listener("time32", server, &mut|listener, Token(_)| {
+            ServiceSocket::Time32(Time32Socket::UnixStreamListener(listener))
+        });
         #[cfg(unix)]
         UnixSocketWrapper::create_datagram_socket("time32", Ready::all(), server,
-            |socket| ServiceSocket::Time32(Time32Socket::UnixDatagram(socket, Vec::new()))
+            &mut|socket, Token(_)| {
+                ServiceSocket::Time32(Time32Socket::UnixDatagram(socket, Vec::new()))
+            }
         );
     }
 

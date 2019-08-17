@@ -11,6 +11,7 @@ mio = "0.6"
 mio-uds = "0.6.7"
 slab = "0.4"
 chrono = "0.4"
+rand = "0.7"
 
 [target.'cfg(unix)'.dependencies] # maybe not not neccessary, but I'm not testing on Windows
 nix = "0.14.1"

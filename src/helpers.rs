@@ -577,20 +577,21 @@ impl<S: Descriptor> UnixSocketWrapper<S> {
 #[cfg(unix)]
 impl UnixSocketWrapper<UnixListener> {
     pub fn create_stream_listener(service_name: &str,  server: &mut Server,
-            encapsulate: fn(Self)->ServiceSocket
+            encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
         let on = format!("{}.socket", service_name);
         if let Some(socket) = Self::create(on, server, |path| UnixListener::bind(path) ) {
             let entry = server.sockets.vacant_entry();
-            server.poll.register(&*socket, Token(entry.key()), Ready::readable(), PollOpt::edge())
+            let token = Token(entry.key());
+            server.poll.register(&*socket, token, Ready::readable(), PollOpt::edge())
                 .expect("Cannot register unix stream listener");
-            entry.insert(encapsulate(socket));
+            entry.insert(encapsulate(socket, token));
         }
         Self::create_seqpacket_listener(service_name, server, encapsulate);
     }
 
     pub fn create_seqpacket_listener(service_name: &str,  server: &mut Server,
-            encapsulate: fn(Self)->ServiceSocket
+            encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
         let on = format!("{}_seqpacket.socket", service_name);
         let res = Self::create(on, server, |path| {
@@ -614,23 +615,25 @@ impl UnixSocketWrapper<UnixListener> {
         });
         if let Some(socket) = res {
             let entry = server.sockets.vacant_entry();
-            server.poll.register(&*socket, Token(entry.key()), Ready::readable(), PollOpt::edge())
+            let token = Token(entry.key());
+            server.poll.register(&*socket, token, Ready::readable(), PollOpt::edge())
                 .expect("Cannot register unix seqpacket listener");
-            entry.insert(encapsulate(socket));
+            entry.insert(encapsulate(socket, token));
         }
     }
 }
 #[cfg(unix)]
 impl UnixSocketWrapper<UnixDatagram> {
     pub fn create_datagram_socket(service_name: &str,  poll_for: Ready,
-            server: &mut Server,  encapsulate: fn(Self)->ServiceSocket
+            server: &mut Server,  encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
         let on = format!("{}_dgram.socket", service_name);
         if let Some(socket) = Self::create(on, server, |path| UnixDatagram::bind(path) ) {
             let entry = server.sockets.vacant_entry();
-            server.poll.register(&*socket, Token(entry.key()), poll_for, PollOpt::edge())
-                        .expect("Cannot register unix datagram socket");
-            entry.insert(encapsulate(socket));
+            let token = Token(entry.key());
+            server.poll.register(&*socket, token, poll_for, PollOpt::edge())
+                .expect("Cannot register unix datagram socket");
+            entry.insert(encapsulate(socket, token));
         }
     }
 }

@@ -158,11 +158,11 @@ impl EchoSocket {
         );
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("echo", server,
-            |listener| ServiceSocket::Echo(UnixStreamListener(listener))
+            &mut|listener, Token(_)| ServiceSocket::Echo(UnixStreamListener(listener))
         );
         #[cfg(unix)]
         UnixSocketWrapper::create_datagram_socket("echo", Ready::all(), server,
-            |socket| ServiceSocket::Echo(UnixDatagram(socket, VecDeque::new()))
+            &mut|socket, Token(_)| ServiceSocket::Echo(UnixDatagram(socket, VecDeque::new()))
         );
     }
 

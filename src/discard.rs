@@ -55,11 +55,11 @@ impl DiscardSocket {
         );
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("discard", server,
-            |listener| ServiceSocket::Discard(UnixStreamListener(listener))
+            &mut|listener, Token(_)| ServiceSocket::Discard(UnixStreamListener(listener))
         );
         #[cfg(unix)]
         UnixSocketWrapper::create_datagram_socket("discard", Ready::readable(), server,
-            |socket| ServiceSocket::Discard(UnixDatagram(socket))
+            &mut|socket, Token(_)| ServiceSocket::Discard(UnixDatagram(socket))
         );
         #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
         listen_posixmq(server, "discard", Ready::readable(),

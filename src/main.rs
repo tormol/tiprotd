@@ -16,6 +16,7 @@
  */
 
 extern crate chrono;
+extern crate rand;
 extern crate slab;
 extern crate mio;
 #[cfg(unix)]

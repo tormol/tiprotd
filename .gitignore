@@ -1,2 +1,6 @@
+# cargo / rustfmt
 /target
 **/*.rs.bk
+
+# private quote database
+/quotes.txt
