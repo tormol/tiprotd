@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::{ErrorKind, Write};
-use std::net::{Shutdown, SocketAddr};
+use std::net::SocketAddr;
 use std::time::SystemTime;
 #[cfg(unix)]
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
@@ -14,67 +14,91 @@ use crate::Server;
 use crate::ServiceSocket;
 use crate::helpers::*;
 
-fn tcp_write_short(stream: &mut TcpStreamWrapper,  mut written: u32,  msg: &[u8])
--> (EntryStatus, u32) {
-    loop {
-        match stream.write(&msg[written as usize..]) {
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (Drained, written),
-            Ok(wrote) if written as usize + wrote == msg.len() => {
-                stream.end(Ok(0), "/*unreachable*/");
-                return (Remove, msg.len() as u32);
-            }
-            Ok(wrote @ 1..=std::usize::MAX) => {
-                if wrote == 0 {
-                    eprintln!("Could only write {} of {} bytes of {} response to tcp://{} o_O",
-                        wrote, msg.len(), stream.service_name, stream.native_addr
+fn tcp_shortsend_accept_loop
+(listener: &TcpListener,  server: &mut Server,  service_name: &'static &'static str,  msg: &[u8])
+-> EntryStatus {
+    let mut remove_listener = false;
+    let accept_result = tcp_accept_loop(listener, server, service_name, Ready::writable(),
+        |stream| {
+            match stream.write(msg) {
+                Ok(wrote) if wrote == msg.len() => stream.end(Ok(0), "/*print unreachable*/"),
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    eprintln!("TCP send buffer appears to have zero capacity! stopping TCP {}",
+                        stream.service_name
                     );
+                    remove_listener = true;
                 }
-                written += wrote as u32;
+                Ok(wrote) if wrote > 0 => {
+                    eprintln!("TCP send buffer is too small to send the {} bytes of {} in one go o_0, stopping TCP {}",
+                        msg.len(), stream.service_name, service_name
+                    );
+                    remove_listener = true;
+                }
+                closing => {
+                    eprintln!("tcp://{} managed to close the connection before we could send the {} bytes of {}",
+                        stream.native_addr, msg.len(), service_name
+                    );
+                    stream.end(closing, &format!("sending {}", service_name));
+                }
             }
-            closing => {
-                eprintln!("tcp://{} managed to close the connection before we could send the {} bytes of {}",
-                    stream.native_addr, msg.len(), stream.service_name
-                );
-                let operation = format!("sending {}", stream.service_name);
-                stream.end(closing, &operation);
-                return (Remove, written);
-            }
-        }
+            None
+        },
+        |_, (), _| unreachable!("{} TCP streams cannot be stored", service_name)
+    );
+    if remove_listener {
+        Remove
+    } else {
+        accept_result
     }
 }
 
 #[cfg(unix)]
-fn unix_stream_write_short(stream: &mut UnixStreamWrapper,  mut written: u32,  msg: &[u8])
--> (EntryStatus, u32) {
-    loop {
-        match stream.write(&msg[written as usize..]) {
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return (Drained, written),
-            Ok(wrote) if written as usize + wrote == msg.len() => {
-                stream.end(Ok(0), "/*unreachable*/");
-                return (Remove, msg.len() as u32);
-            }
-            Ok(wrote @ 1..=std::usize::MAX) => {
-                if wrote == 0 {
-                    eprintln!("Could only write {} of {} bytes of {} response to uds://{:?} o_O",
-                        wrote, msg.len(), stream.service_name, stream.addr
+fn unix_stream_shortsend_accept_loop
+(listener: &UnixListener,  server: &mut Server,  service_name: &'static &'static str,  msg: &[u8])
+-> EntryStatus {
+    let mut remove_listener = false;
+    let accept_result = unix_stream_accept_loop(listener, server, service_name, Ready::writable(),
+        |stream| {
+            match stream.write(msg) {
+                Ok(wrote) if wrote == msg.len() => stream.end(Ok(0), "/*print unreachable*/"),
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    eprintln!(
+                        "unix stream send buffer appears to have zero capacity! stopping TCP {}",
+                        stream.service_name
                     );
+                    remove_listener = true;
                 }
-                written += wrote as u32;
+                Ok(wrote) if wrote > 0 => {
+                    eprintln!("unix stream send buffer is too small to send the {} bytes of {} in one go o_0, stopping TCP {}",
+                        msg.len(), stream.service_name, service_name
+                    );
+                    remove_listener = true;
+                }
+                closing => {
+                    eprintln!("uds://{:?} managed to close the connection before we could send the {} bytes of {}",
+                        stream.addr, msg.len(), service_name
+                    );
+                    stream.end(closing, &format!("sending {}", service_name));
+                }
             }
-            closing => {
-                eprintln!("uds://{:?} managed to close the connection before we could send the {} bytes of {}",
-                    stream.addr, msg.len(), stream.service_name
-                );
-                let operation = format!("sending {}", stream.service_name);
-                stream.end(closing, &operation);
-                return (Remove, written);
-            }
-        }
+            None
+        },
+        |_, (), _| unreachable!("{} unix stream connections cannot be stored", service_name)
+    );
+    if remove_listener {
+        Remove
+    } else {
+        accept_result
     }
 }
 
-fn udp_short(socket: &UdpSocket,  outstanding: &mut HashSet<SocketAddr>,
-        readiness: Ready,  server: &mut Server,  msg: &[u8],  service_name: &str
+fn udp_shortsend(
+        socket: &UdpSocket,
+        server: &mut Server,
+        service_name: &str,
+        readiness: Ready,
+        outstanding: &mut HashSet<SocketAddr>,
+        msg: &[u8]
 ) -> EntryStatus {
     if readiness.is_readable() {
         loop {
@@ -83,7 +107,7 @@ fn udp_short(socket: &UdpSocket,  outstanding: &mut HashSet<SocketAddr>,
                 // send errors might be returned on the next read
                 Err(e) => eprintln!("UDP {} error (on receive): {}", service_name, e),
                 Ok((len, from)) => {
-                    if server.limits.allow_unacknowledged_send(from, QOTD.len()) {
+                    if server.limits.allow_unacknowledged_send(from, msg.len()) {
                         eprintln!("{} udp://{} sends {} bytes for {}",
                             now(), native_addr(from), len, service_name
                         );
@@ -106,8 +130,12 @@ fn udp_short(socket: &UdpSocket,  outstanding: &mut HashSet<SocketAddr>,
 }
 
 #[cfg(unix)]
-fn unix_datagram_short(socket: &UnixDatagram,  outstanding: &mut Vec<UnixSocketAddr>,
-        readiness: Ready,  msg: &[u8],  service_name: &str
+fn unix_datagram_shortsend(
+        socket: &UnixDatagram,
+        service_name: &str,
+        readiness: Ready,
+        outstanding: &mut Vec<UnixSocketAddr>,
+        msg: &[u8],
 ) -> EntryStatus {
     if readiness.is_readable() {
         loop {
@@ -142,12 +170,9 @@ const QOTD: &[u8] = b"No quote today, the DB has gone away\n";
 
 pub enum QotdSocket {
     TcpListener(TcpListener),
-    TcpConn(TcpStreamWrapper, u32),
     Udp(UdpSocket, HashSet<SocketAddr>),
     #[cfg(unix)]
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
-    #[cfg(unix)]
-    UnixStreamConn(UnixStreamWrapper, u32),
     #[cfg(unix)]
     UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>), // doesn't implement Hash
     #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
@@ -180,49 +205,18 @@ impl QotdSocket {
     pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
         match self {
             &mut QotdSocket::TcpListener(ref listener) => {
-                tcp_accept_loop(listener, server, &"qotd", Ready::writable(),
-                    |stream| match tcp_write_short(stream, 0, QOTD) {
-                        (Drained, wrote) => Some(wrote),
-                        (Remove, _) => None,
-                        (_, _) => unreachable!()
-                    },
-                    |stream, written, Token(_)| {
-                        stream.shutdown(Shutdown::Read);
-                        ServiceSocket::Qotd(QotdSocket::TcpConn(stream, written))
-                    }
-                )
-            }
-            &mut QotdSocket::TcpConn(ref mut stream, ref mut written) => {
-                let (status, now_written) = tcp_write_short(stream, *written, QOTD);
-                *written = now_written;
-                status
+                tcp_shortsend_accept_loop(listener, server, &"qotd", QOTD)
             }
             #[cfg(unix)]
             &mut QotdSocket::UnixStreamListener(ref listener) => {
-                unix_stream_accept_loop(listener, server, &"qotd", Ready::writable(),
-                    |stream| match unix_stream_write_short(stream, 0, QOTD) {
-                        (Drained, wrote) => Some(wrote),
-                        (Remove, _) => None,
-                        (_, _) => unreachable!()
-                    },
-                    |stream, written, Token(_)| {
-                        stream.shutdown(Shutdown::Read);
-                        ServiceSocket::Qotd(QotdSocket::UnixStreamConn(stream, written))
-                    }
-                )
-            }
-            #[cfg(unix)]
-            &mut QotdSocket::UnixStreamConn(ref mut stream, ref mut written) => {
-                let (status, now_written) = unix_stream_write_short(stream, *written, QOTD);
-                *written = now_written;
-                status
+                unix_stream_shortsend_accept_loop(listener, server, &"qotd", QOTD)
             }
             &mut QotdSocket::Udp(ref socket, ref mut outstanding) => {
-                udp_short(socket, outstanding, readiness, server, QOTD, "qotd")
+                udp_shortsend(socket, server, "qotd", readiness, outstanding, QOTD)
             }
             #[cfg(unix)]
             &mut QotdSocket::UnixDatagram(ref socket, ref mut outstanding) => {
-                unix_datagram_short(socket, outstanding, readiness, QOTD, "qotd")
+                unix_datagram_shortsend(socket, "qotd", readiness, outstanding, QOTD)
             }
             #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
             &mut QotdSocket::PosixMq(ref mq) => {
@@ -244,13 +238,10 @@ impl QotdSocket {
         match self {
             &QotdSocket::TcpListener(ref listener) => Some(listener),
             &QotdSocket::Udp(ref socket, _) => Some(socket),
-            &QotdSocket::TcpConn(ref conn, _) => Some(&**conn),
             #[cfg(unix)]
             &QotdSocket::UnixStreamListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
             &QotdSocket::UnixDatagram(ref socket, _) => Some(&**socket),
-            #[cfg(unix)]
-            &QotdSocket::UnixStreamConn(ref conn, _) => Some(&**conn),
             #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
             &QotdSocket::PosixMq(ref mq) => Some(&**mq),
         }
@@ -262,12 +253,9 @@ const TIME32_PORT: u16 = 37;
 
 pub enum Time32Socket {
     TcpListener(TcpListener),
-    TcpConn(TcpStreamWrapper),
     Udp(UdpSocket, HashSet<SocketAddr>),
     #[cfg(unix)]
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
-    #[cfg(unix)]
-    UnixStreamConn(UnixStreamWrapper),
     #[cfg(unix)]
     UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>),
 }
@@ -323,43 +311,18 @@ impl Time32Socket {
         let sometime = new_time32();
         match self {
             &mut Time32Socket::TcpListener(ref listener) => {
-                tcp_accept_loop(listener, server, &"time32", Ready::writable(),
-                    |stream| match tcp_write_short(stream, 0, &sometime) {
-                        (Drained, 0) => Some(()),
-                        _ => None
-                    },
-                    |stream, (), Token(_)| ServiceSocket::Time32(Time32Socket::TcpConn(stream))
-                )
-            }
-            &mut Time32Socket::TcpConn(ref mut stream) => {
-                match tcp_write_short(stream, 0, &sometime) {
-                    (Drained, 0) => Drained,
-                    _ => Remove,
-                }
+                tcp_shortsend_accept_loop(listener, server, &"time32", &sometime)
             }
             #[cfg(unix)]
             &mut Time32Socket::UnixStreamListener(ref listener) => {
-                unix_stream_accept_loop(listener, server, &"time32", Ready::writable(),
-                    |stream| match unix_stream_write_short(stream, 0, &sometime) {
-                        (Drained, 0) => Some(()),
-                        _ => None
-                    },
-                    |stream, (), _| ServiceSocket::Time32(Time32Socket::UnixStreamConn(stream))
-                )
-            }
-            #[cfg(unix)]
-            &mut Time32Socket::UnixStreamConn(ref mut stream) => {
-                match unix_stream_write_short(stream, 0, &sometime) {
-                    (Drained, 0) => Drained,
-                    _ => Remove,
-                }
+                unix_stream_shortsend_accept_loop(listener, server, &"time32", &sometime)
             }
             &mut Time32Socket::Udp(ref socket, ref mut outstanding) => {
-                udp_short(socket, outstanding, readiness, server, &sometime, "time32")
+                udp_shortsend(socket, server, "time32", readiness, outstanding, &sometime)
             }
             #[cfg(unix)]
             &mut Time32Socket::UnixDatagram(ref socket, ref mut outstanding) => {
-                unix_datagram_short(socket, outstanding, readiness, &sometime, "time32")
+                unix_datagram_shortsend(socket, "time32", readiness, outstanding, &sometime)
             }
         }
     }
@@ -368,13 +331,10 @@ impl Time32Socket {
         match self {
             &Time32Socket::TcpListener(ref listener) => Some(listener),
             &Time32Socket::Udp(ref socket, _) => Some(socket),
-            &Time32Socket::TcpConn(ref conn) => Some(&**conn),
             #[cfg(unix)]
             &Time32Socket::UnixStreamListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
             &Time32Socket::UnixDatagram(ref socket, _) => Some(&**socket),
-            #[cfg(unix)]
-            &Time32Socket::UnixStreamConn(ref conn) => Some(&**conn),
         }
     }
 }
