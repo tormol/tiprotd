@@ -61,6 +61,7 @@ const UDP_SEND_LIMIT: u32 = 1*1024*1024;
 /// /24 block from DoSing.
 const RESOURCE_LIMIT: u32 = 256*1024;
 
+#[derive(Debug)]
 pub enum ServiceSocket {
     #[cfg(unix)]
     SignalReceiver(signal::SignalReceiver),

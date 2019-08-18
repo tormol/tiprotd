@@ -175,6 +175,7 @@ const FALLBACK_QOTD: &[u8] = b"No quote today, the DB has gone away\n";
 
 type QuoteDb = Rc<[Box<[u8]>]>;
 
+#[derive(Debug)]
 pub enum QotdSocket {
     TcpListener(TcpListener, QuoteDb, u32),
     Udp(UdpSocket, HashSet<SocketAddr>, QuoteDb, u32),
@@ -367,6 +368,7 @@ impl QotdSocket {
 
 const TIME32_PORT: u16 = 37;
 
+#[derive(Debug)]
 pub enum Time32Socket {
     TcpListener(TcpListener),
     Udp(UdpSocket, HashSet<SocketAddr>),

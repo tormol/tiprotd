@@ -16,6 +16,7 @@ use crate::helpers::*;
 
 const ECHO_PORT: u16 = 7; // read and write
 
+#[derive(Debug)]
 pub enum EchoSocket {
     TcpListener(TcpListener),
     TcpConn(TcpStreamWrapper, VecDeque<u8>, bool),

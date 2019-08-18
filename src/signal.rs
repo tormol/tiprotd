@@ -149,11 +149,13 @@ impl SignalReceiver {
 }
 
 fn start_shutdown(server: &mut Server) {
-    // println!("shutting down");
-    for i in 0..server.sockets.len() {
+    // cannot use normal iterator because we might remove elements.
+    // loop until .capacity() because .len() is the number of present elements
+    // which will be less than some element's keys if there are holes.
+    for i in 0..server.sockets.capacity() {
         let descriptor = match server.sockets.get(i).and_then(|entry| entry.inner_descriptor() ) {
             Some(descriptor) => descriptor.as_any(),
-            None => continue, // this leaves 
+            None => continue, // this lets the self-pipe remain
         };
         if !descriptor.is::<TcpStream>() && !descriptor.is::<UnixStream>() {
             server.sockets.remove(i);
@@ -168,4 +170,7 @@ fn start_shutdown(server: &mut Server) {
 
 fn print_state(server: &mut Server) {
     eprintln!("sockets: {}", server.sockets.len());
+    for socket in &server.sockets {
+        eprintln!("\t{:?}", socket);
+    }
 }

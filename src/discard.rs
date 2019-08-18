@@ -13,6 +13,7 @@ use crate::helpers::*;
 
 const DISCARD_PORT: u16 = 9;
 
+#[derive(Debug)]
 pub enum DiscardSocket {
     // On *nix I could merge many of these, using read() directly,
     // but need to release resources

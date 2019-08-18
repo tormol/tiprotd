@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::error::Error;
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Display, Debug, Formatter};
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddr, Shutdown};
 use std::ops::{Deref, DerefMut};
@@ -420,6 +420,14 @@ impl TcpStreamWrapper {
         }
     }
 }
+impl Debug for TcpStreamWrapper {
+    fn fmt(&self,  fmtr: &mut Formatter) -> Result<(), fmt::Error> {
+        fmtr.debug_tuple("TcpStreamWrapper")
+            .field(self.service_name)
+            .field(&self.stream)
+            .finish()
+    }
+}
 
 
 #[cfg(all(unix, not(any(target_os="macos", target_os="dragonfly", target_os="openbsd"))))]
@@ -527,6 +535,7 @@ pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
 
 /// also for listeners, deletes on drop if named
 #[cfg(unix)]
+#[derive(Debug)]
 pub struct UnixSocketWrapper<S: Descriptor>(pub S, pub Box<str>);
 #[cfg(unix)]
 impl<S: Descriptor> UnixSocketWrapper<S> {
@@ -656,6 +665,7 @@ impl<S: Descriptor> Drop for UnixSocketWrapper<S> {
 }
 
 #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+#[derive(Debug)]
 pub struct PosixMqWrapper(pub posixmq::PosixMq, pub &'static str);
 #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
 impl Deref for PosixMqWrapper {
@@ -722,6 +732,7 @@ pub fn unix_stream_accept_loop<
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
 pub struct UnixStreamWrapper {
     stream: UnixStream,
     pub addr: UnixSocketAddr,
