@@ -13,6 +13,7 @@ use mio::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
 use rand::seq::SliceRandom;
+use chrono::{TimeZone, Utc, offset::FixedOffset, DateTime, NaiveDateTime};
 
 use crate::Server;
 use crate::ServiceSocket;
@@ -455,6 +456,109 @@ impl Time32Socket {
             &Time32Socket::UnixStreamListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
             &Time32Socket::UnixDatagram(ref socket, _) => Some(&**socket),
+        }
+    }
+}
+
+
+const DAYTIME_PORT: u16 = 13;
+
+#[derive(Debug)]
+pub enum DaytimeSocket {
+    TcpListener(TcpListener),
+    Udp(UdpSocket, HashSet<SocketAddr>),
+    #[cfg(unix)]
+    UnixStreamListener(UnixSocketWrapper<UnixListener>),
+    #[cfg(unix)]
+    UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>),
+}
+
+/// Cet the current time in some^* timezone.
+///
+/// The timezone is rounded to hours, and is based on a random number
+/// and centered on the local timezone.
+/// The distribution of the random number is Uniform(0..1)^2
+/// which is apparently called a beta distribution with paramaters 𝛼=1/n and 1:
+/// https://en.wikipedia.org/wiki/Uniform_distribution_(continuous)#Related_distributions
+fn new_daytime() -> String {
+    let now_utc: NaiveDateTime = Utc::now().naive_utc();
+    let random_hour_offset: i32 = {
+        let now_local: NaiveDateTime = chrono::Local::now().naive_local();
+        // there is a race condition in here if the hour changes between
+        // Utc::now() and Local::now(), but the offset is only used for
+        // centering the distribution, so it won't be visible.
+        let local_offset = (now_local.timestamp() - now_utc.timestamp()) as i32 / (60*60);
+        let random01 = rand::random::<f32>();
+        let random11 = (random01-0.5)*2.0;
+        let uneven = random11 * random11.abs(); // FIXME namee of this distribution
+        let hours = (uneven * 13.0/*exclusive*/) as i32;
+        match hours + local_offset {
+            fine @ -12..=12 => fine,
+            west_overflow @ -36..=-13 => west_overflow+24,
+            east_overflow @ 13..=36 => east_overflow-24,
+            unexpected => {
+                eprintln!("{} Created unexpected timezone offset {} from {}+{}",
+                        now()/*ugh*/, unexpected, hours, local_offset
+                );
+                -11 // should be quite rare
+            }
+        }
+    };
+    let tz: FixedOffset = FixedOffset::east(random_hour_offset*60*60);
+    let now_somewhere: DateTime<FixedOffset> = tz.from_utc_datetime(&now_utc);
+    now_somewhere.format("%Y-%m-%d %H:%M:%S %Z\n").to_string()
+}
+
+impl DaytimeSocket {
+    pub fn setup(server: &mut Server) {
+        listen_tcp(server, "daytime", DAYTIME_PORT,
+            &mut|listener, Token(_)| ServiceSocket::Daytime(DaytimeSocket::TcpListener(listener))
+        );
+        listen_udp(server, "daytime", DAYTIME_PORT, Ready::readable() | Ready::writable(),
+            &mut|socket, Token(_)| {
+                ServiceSocket::Daytime(DaytimeSocket::Udp(socket, HashSet::new()))
+            }
+        );
+        #[cfg(unix)]
+        UnixSocketWrapper::create_stream_listener("daytime", server, &mut|listener, Token(_)| {
+            ServiceSocket::Daytime(DaytimeSocket::UnixStreamListener(listener))
+        });
+        #[cfg(unix)]
+        UnixSocketWrapper::create_datagram_socket("daytime", Ready::all(), server,
+            &mut|socket, Token(_)| {
+                ServiceSocket::Daytime(DaytimeSocket::UnixDatagram(socket, Vec::new()))
+            }
+        );
+    }
+
+    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+        let somewhere = new_daytime().into_bytes();
+        match self {
+            &mut DaytimeSocket::TcpListener(ref listener) => {
+                tcp_shortsend_accept_loop(listener, server, &"time32", &somewhere)
+            }
+            #[cfg(unix)]
+            &mut DaytimeSocket::UnixStreamListener(ref listener) => {
+                unix_stream_shortsend_accept_loop(listener, server, &"time32", &somewhere)
+            }
+            &mut DaytimeSocket::Udp(ref socket, ref mut outstanding) => {
+                udp_shortsend(socket, server, "time32", readiness, outstanding, &somewhere)
+            }
+            #[cfg(unix)]
+            &mut DaytimeSocket::UnixDatagram(ref socket, ref mut outstanding) => {
+                unix_datagram_shortsend(socket, "time32", readiness, outstanding, &somewhere)
+            }
+        }
+    }
+
+    pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
+        match self {
+            &DaytimeSocket::TcpListener(ref listener) => Some(listener),
+            &DaytimeSocket::Udp(ref socket, _) => Some(socket),
+            #[cfg(unix)]
+            &DaytimeSocket::UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(unix)]
+            &DaytimeSocket::UnixDatagram(ref socket, _) => Some(&**socket),
         }
     }
 }
