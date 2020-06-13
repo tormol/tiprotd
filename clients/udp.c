@@ -1,6 +1,9 @@
 // A simple UDP client or server sporting some async features.
 
-#define _POSIX_C_SOURCE 200809L // 2008.09 needed for SA_RESETHAND and the S_IF* fd types
+#ifdef __linux__
+    #define _POSIX_C_SOURCE 200809L // 2008.09 needed for SA_RESETHAND and the S_IF* fd types with glibc
+#endif
+
 #include <sys/socket.h> // socket(), struct sockaddr, ...
 #include <netinet/in.h> // struct inaddr_in{,6}, ...
 #include <arpa/inet.h> // inet_ntop()
@@ -106,6 +109,11 @@ int bind_any(const char *port) {
     any.sin6_port = port==NULL ? 0 : htons(parseport(port));
     any.sin6_addr = in6addr_any; // not really necessary; it's already zero
     int sock = checkerr(socket(any.sin6_family, SOCK_DGRAM, 0), "create UDP socket");
+#ifndef __linux__ // disabled by default on Linux
+    int only_ipv6 = 0;
+    checkerr(setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &only_ipv6, sizeof(int)),
+        "make socket accept IPv4 in addition to IPv6");
+#endif
     // you probably want to set SO_REUSEADDR, see try_bind() below
     checkerr(bind(sock, (struct sockaddr*)&any, sizeof(struct sockaddr_in6)),
         "bind to %s", sockaddr2str((struct sockaddr*)&any));

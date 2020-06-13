@@ -1,4 +1,4 @@
-CC=gcc
+CC?=gcc
 CFLAGS=-Wall -Wextra -Wpedantic -std=c11 -g
 
 all: tcp udp sctp1 udplite dccp unix_stream unix_dgram unix_seqpacket mq time32
