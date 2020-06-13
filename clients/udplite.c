@@ -274,14 +274,25 @@ int connect_to(const char *domain, const char *port) {
     return sock;
 }
 
+void set_options(int sock, const char *recv_cscov, const char *send_cscov) {
+    if (recv_cscov != NULL) {
+        int coverage = parseport(recv_cscov);
+        checkerr(setsockopt(sock, IPPROTO_UDPLITE, UDPLITE_RECV_CSCOV, &coverage, sizeof(int)),
+           "set checksum coverage filter to %d", coverage);
+    }
+    if (send_cscov != NULL) {
+        int coverage = parseport(send_cscov);
+        checkerr(setsockopt(sock, IPPROTO_UDPLITE, UDPLITE_SEND_CSCOV, &coverage, sizeof(int)),
+            "set checksum coverage for sent packets to %d", coverage);
+    }
+}
+
 
 /* program modes */
 
 // reply to any received datagram with the same content, and print them to stdout
-void echo(int sock) {
-    // const int minimum = 8; // aka only header. this is the default
-    // checkerr(setsockopt(sock, IPPROTO_UDPLITE, UDPLITE_RECV_CSCOV, &minimum, sizeof(int)),
-    //     "set minimum checksum coverage of received packets");
+void echo(int sock, const char *recv_cscov, const char *send_cscov) {
+    set_options(sock, recv_cscov, send_cscov);
     char buf[BUFFER_SIZE];
     struct sockaddr_storage peer;
     socklen_t addrlen = sizeof(struct sockaddr_storage);
@@ -299,7 +310,8 @@ void echo(int sock) {
 }
 
 // connect() the socket to the first client, then call perform() and close() the socket afterwards
-void serve_one(int sock, ssize_t(*perform)(int)) {
+void serve_one(int sock, const char* recv_cscov, const char* send_cscov, ssize_t(*perform)(int)) {
+    set_options(sock, recv_cscov, send_cscov);
     struct sockaddr_storage peer;
     socklen_t addrlen = sizeof(struct sockaddr_storage);
     checkerr((int)recvfrom(sock, NULL, 0, MSG_PEEK, (struct sockaddr*)&peer, &addrlen),
@@ -314,14 +326,10 @@ void serve_one(int sock, ssize_t(*perform)(int)) {
     checkerr(close(sock), "close socket connected to %s", peer_addr);
 }
 
-// set UDPLITE_RECV_CSCOV, then call perform() and close() the socket
-void client(int sock, ssize_t(*perform)(int)) {
+// set options, then call perform() and close() the socket
+void client(int sock, const char* recv_cscov, const char* send_cscov, ssize_t(*perform)(int)) {
     fprintf(stderr, "Connected, from %s\n", local2str(sock));
-    // set minimum checksum coverage filter to server port number % 100
-    // (doesn't seem to have any effect)
-    int min_recv_cscov = getport(sock, getpeername) % 100;
-    checkerr(setsockopt(sock, IPPROTO_UDPLITE, UDPLITE_RECV_CSCOV, &min_recv_cscov, sizeof(int)),
-        "set minimum checksum coverage of received packets to %d", min_recv_cscov);
+    set_options(sock, recv_cscov, send_cscov);
     ssize_t lastret = perform(sock);
     if (lastret == -1) {
         fprintf(stderr, "Error: %s\n", strerror(errno));
@@ -372,9 +380,6 @@ void make_stdin_nonblocking() {
 // send stdin to socket and socket to stdout, using select() to avoid blocking on either side.
 ssize_t interactive_async_read(int sock) {
     make_stdin_nonblocking();
-    const int first_three = 8+3;
-    checkerr(setsockopt(sock, IPPROTO_UDPLITE, UDPLITE_SEND_CSCOV, &first_three, sizeof(int)),
-        "set checksum coverage for sent packets to %d", first_three);
     char buf[BUFFER_SIZE];
     ssize_t received;
     // main loop; runs until either stdin reaches EOF or peer disconnects
@@ -412,24 +417,32 @@ ssize_t interactive_async_read(int sock) {
 
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "listen")) {
-        serve_one(bind_any(argv[2]), interactive_async_read);
+        serve_one(bind_any(argv[2]), NULL, NULL, interactive_async_read);
     } else if (argc == 4 && !strcmp(argv[1], "listen")) {
-        serve_one(bind_on(argv[2], argv[3]), interactive_async_read);
+        serve_one(bind_on(argv[2], argv[3]), NULL, NULL, interactive_async_read);
+    } else if (argc == 6 && !strcmp(argv[1], "listen")) {
+        serve_one(bind_on(argv[2], argv[3]), argv[4], argv[5], interactive_async_read);
     } else if (argc == 3 && !strcmp(argv[1], "echo")) {
-        echo(bind_any(argv[2]));
+        echo(bind_any(argv[2]), NULL, NULL);
     } else if (argc == 4 && !strcmp(argv[1], "echo")) {
-        echo(bind_on(argv[2], argv[3]));
+        echo(bind_on(argv[2], argv[3]), NULL, NULL);
+    } else if (argc == 6 && !strcmp(argv[1], "echo")) {
+        echo(bind_on(argv[2], argv[3]), argv[4], argv[5]);
     } else if (argc == 2) {
-        client(connect_to_localhost(argv[1]), interactive_async_read);
+        client(connect_to_localhost(argv[1]), NULL, NULL, interactive_async_read);
+    } else if (argc == 4) {
+        client(connect_to_localhost(argv[1]), argv[2], argv[3], interactive_async_read);
     } else if (argc == 3) {
-        client(connect_to(argv[1], argv[2]), interactive_async_read);
+        client(connect_to(argv[1], argv[2]), NULL, NULL, interactive_async_read);
     } else if (argc == 5) {
-        client(connect_from_to(argv[1], argv[2], argv[3], argv[4]), interactive_async_read);
+        client(connect_from_to(argv[1], argv[2], argv[3], argv[4]), NULL, NULL, interactive_async_read);
+    } else if (argc == 7) {
+        client(connect_from_to(argv[1], argv[2], argv[3], argv[4]), argv[5], argv[6], interactive_async_read);
     } else {
         fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "\tudplite [[source_addr source_port] domain] port - select()-based client\n");
-        fprintf(stderr, "\tudplite listen [addr] port - select()-based server\n");
-        fprintf(stderr, "\tudplite echo [addr] port - echo server\n");
+        fprintf(stderr, "\tudplite [[source_addr source_port] domain] port [recv_cscov send_cscov] - select()-based client\n");
+        fprintf(stderr, "\tudplite listen [addr] port [recv_cscov send_cscov] - select()-based server\n");
+        fprintf(stderr, "\tudplite echo [addr] port [recv_cscov send_cscov] - echo server\n");
         exit(1);
     }
     return 0;
