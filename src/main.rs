@@ -36,7 +36,6 @@ mod echo;
 mod shortsend;
 mod signal;
 
-use std::error::Error;
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::mem;
@@ -154,7 +153,7 @@ impl Server {
             }
             Err(e) => {
                 eprintln!("Cannot listen on {}://{} (for {}): {}",
-                    protocol_name, on, service_name, e.description()
+                    protocol_name, on, service_name, e
                 );
                 None
             }

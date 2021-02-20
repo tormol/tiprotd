@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::error::Error;
 use std::fmt::{self, Display, Debug, Formatter};
 use std::io::{self, ErrorKind};
 use std::net::{Ipv4Addr, SocketAddr, Shutdown};
@@ -414,7 +413,7 @@ impl TcpStreamWrapper {
     }
     pub fn end(&self,  cause: Result<usize,io::Error>,  operation: &str) {
         if let Err(e) = cause {
-            eprintln!("tcp://{} error {}: {}, closing", self.native_addr, operation, e.description());
+            eprintln!("tcp://{} error {}: {}, closing", self.native_addr, operation, e);
         } else {
             self.shutdown(Shutdown::Both);
         }
@@ -577,7 +576,7 @@ impl<S: Descriptor> UnixSocketWrapper<S> {
                 }
             }
             Err(e) => {
-                eprintln!("Cannot listen on {}: {}", on, e.description());
+                eprintln!("Cannot listen on {}: {}", on, e);
                 None
             }
         }
@@ -761,7 +760,7 @@ impl UnixStreamWrapper {
     }
     pub fn end(&self,  cause: Result<usize,io::Error>,  operation: &str) {
         if let Err(e) = cause {
-            eprintln!("uds://{:?} error {}: {}, closing", self.addr, operation, e.description());
+            eprintln!("uds://{:?} error {}: {}, closing", self.addr, operation, e);
         } else {
             self.shutdown(Shutdown::Both);
         }
