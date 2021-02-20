@@ -187,7 +187,7 @@ pub enum QotdSocket {
         UnixSocketWrapper<UnixDatagram>,
         Box<(Vec<UnixSocketAddr>/*doesn't implement Hash*/, QuoteDb, u32)>
     ),
-    #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+    #[cfg(feature="posixmq")]
     PosixMq(PosixMqWrapper, QuoteDb, u32),
 }
 
@@ -273,7 +273,7 @@ impl QotdSocket {
                 ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, state))
             }
         );
-        #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+        #[cfg(feature="posixmq")]
         listen_posixmq(server, "qotd", Ready::writable(),
             posixmq::OpenOptions::writeonly()
                 .mode(0o644)
@@ -336,7 +336,7 @@ impl QotdSocket {
                 *pos %= quotes.len() as u32;
                 status
             }
-            #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+            #[cfg(feature="posixmq")]
             &mut QotdSocket::PosixMq(ref mq, ref quotes, ref mut pos) => {
                 loop {
                     match mq.send(0, &quotes[*pos as usize]) {
@@ -360,7 +360,7 @@ impl QotdSocket {
             &QotdSocket::UnixStreamListener(ref listener, _, _) => Some(&**listener),
             #[cfg(unix)]
             &QotdSocket::UnixDatagram(ref socket, _) => Some(&**socket),
-            #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+            #[cfg(feature="posixmq")]
             &QotdSocket::PosixMq(ref mq, _, _) => Some(&**mq),
         }
     }

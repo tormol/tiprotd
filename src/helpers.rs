@@ -247,9 +247,9 @@ pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
         std::process::exit(1);
     }
 
-    #[cfg(all(unix, not(any(target_os="macos", target_os="dragonfly", target_os="openbsd"))))]
+    #[cfg(feature="sctp")]
     listen_sctp(server, service_name, port, encapsulate);
-    #[cfg(any(target_os="linux", target_os="freebsd"/*probably not*/))]
+    #[cfg(feature="dccp")]
     listen_dccp(server, service_name, port, encapsulate);
 }
 
@@ -429,7 +429,7 @@ impl Debug for TcpStreamWrapper {
 }
 
 
-#[cfg(all(unix, not(any(target_os="macos", target_os="dragonfly", target_os="openbsd"))))]
+#[cfg(feature="sctp")]
 pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
         encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
 ) {
@@ -453,7 +453,7 @@ pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
     }
 }
 
-#[cfg(any(target_os="linux", target_os="freebsd"/*probably not*/))]
+#[cfg(feature="dccp")]
 pub fn listen_dccp(server: &mut Server,  service_name: &'static str,  port: u16,
         encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
 ) {
@@ -487,14 +487,14 @@ pub fn listen_udp(server: &mut Server,  service_name: &'static str,
     ).unwrap_or_else(|| std::process::exit(1) );
     let token = Token(entry.key()); // make borrowck happy
     entry.insert(encapsulate(socket, token));
-    #[cfg(any(target_os="linux", target_os="freebsd"))]
+    #[cfg(feature="udplite")]
     listen_udplite(server, service_name, port, poll_for, encapsulate);
 }
 
 
 /// Create a mio UdpSocket actually representing an UDP-lite socket
 /// bound to the specified port and register it.
-#[cfg(any(target_os="linux", target_os="freebsd"))]
+#[cfg(feature="udplite")]
 pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
         port: u16,  poll_for: Ready,
         encapsulate: &mut dyn FnMut(UdpSocket, Token)->ServiceSocket
@@ -663,17 +663,17 @@ impl<S: Descriptor> Drop for UnixSocketWrapper<S> {
     }
 }
 
-#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+#[cfg(feature="posixmq")]
 #[derive(Debug)]
 pub struct PosixMqWrapper(pub posixmq::PosixMq, pub &'static str);
-#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+#[cfg(feature="posixmq")]
 impl Deref for PosixMqWrapper {
     type Target = posixmq::PosixMq;
     fn deref(&self) -> &posixmq::PosixMq {
         &self.0
     }
 }
-#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+#[cfg(feature="posixmq")]
 impl Drop for PosixMqWrapper {
     fn drop(&mut self) {
         if let Err(e) = posixmq::unlink(self.1) {
@@ -856,7 +856,7 @@ pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &UnixSocketAddr
 /// Create a posix message queue, open it as nonblocking and register it with mio.
 ///
 /// capacity and max message size should be set via the options parameter.
-#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+#[cfg(feature="posixmq")]
 pub fn listen_posixmq(server: &mut Server,  service_name: &'static str,  poll_for: Ready,
         options: &mut posixmq::OpenOptions,
         encapsulate: &mut dyn FnMut(PosixMqWrapper, Token)->ServiceSocket

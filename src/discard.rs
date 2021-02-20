@@ -140,7 +140,7 @@ pub enum DiscardSocket {
     UnixDatagram(UnixSocketWrapper<UnixDatagram>),
     #[cfg(unix)]
     NamedPipe(NamedPipe),
-    #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+    #[cfg(feature="posixmq")]
     PosixMq(PosixMqWrapper),
 }
 
@@ -176,7 +176,7 @@ impl DiscardSocket {
         );
         #[cfg(unix)]
         create_and_register_pipe("discard.pipe", server);
-        #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+        #[cfg(feature="posixmq")]
         listen_posixmq(server, "discard", Ready::readable(),
             posixmq::OpenOptions::readonly()
                 .mode(0o622)
@@ -280,7 +280,7 @@ impl DiscardSocket {
                     }
                 }
             }
-            #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+            #[cfg(feature="posixmq")]
             &mut PosixMq(ref mq) => {
                 loop {
                     match mq.receive(&mut server.buffer) {
@@ -309,7 +309,7 @@ impl DiscardSocket {
             &UnixStreamConn(ref conn) => Some(&**conn),
             #[cfg(unix)]
             &NamedPipe(ref pipe) => Some(pipe),
-            #[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+            #[cfg(feature="posixmq")]
             &PosixMq(ref mq) => Some(&**mq),
         }
     }

@@ -21,7 +21,7 @@ extern crate slab;
 extern crate mio;
 #[cfg(unix)]
 extern crate mio_uds;
-#[cfg(any(target_os="linux", target_os="freebsd", target_os="dragonfly", target_os="netbsd"))]
+#[cfg(feature="posixmq")]
 extern crate posixmq;
 #[cfg(unix)]
 extern crate nix;

@@ -9,12 +9,31 @@ edition = "2018"
 [dependencies]
 mio = "0.6"
 mio-uds = "0.6.7"
+posixmq = {version="0.2", features=["mio"], optional=true}
 slab = "0.4"
 chrono = "0.4"
 rand = "0.7"
 
-[target.'cfg(unix)'.dependencies] # maybe not not neccessary, but I'm not testing on Windows
+[target.'cfg(unix)'.dependencies] # maybe not neccessary, but I'm not testing on Windows
 nix = "0.14.1"
 
-[target.'cfg(target_os="linux")'.dependencies]
-posixmq = {version="0.2", features=["mio"]}
+[features]
+sctp = []
+udplite = []
+dccp = []
+seqpacket = []
+
+#[target.'cfg(target_os="linux")'.features]
+default = ["sctp", "udplite", "dccp", "seqpacket", "posixmq"]
+#[target.'cfg(target_os="android")'.features]
+#default = ["sctp", "udplite", "dccp", "seqpacket"]
+#[target.'cfg(target_os="freebsd")'.features]
+#default = ["sctp", "udplite", "seqpacket", "posixmq"]
+#[target.'cfg(any(target_os="netbsd"))'.features]
+#default = ["sctp", "seqpacket", "posixmq"]
+#[target.'cfg(target_os="illumos")'.features]
+#default = ["sctp", "seqpacket"] # posixmq cannot be used with mio on Illumos
+#[target.'cfg(any(target_os="openbsd", target_vendor="apple"))'.features]
+#default = ["seqpacket"]
+#[target.'cfg(target_os="dragonfly")'.features]
+#default = ["seqppacket", "posixmq"]
