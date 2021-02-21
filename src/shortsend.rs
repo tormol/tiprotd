@@ -12,6 +12,8 @@ use mio::{Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
+#[cfg(feature="seqpacket")]
+use uds::nonblocking::UnixSeqpacketListener;
 use rand::seq::SliceRandom;
 use chrono::{TimeZone, Utc, offset::FixedOffset, DateTime, NaiveDateTime};
 
@@ -74,7 +76,8 @@ fn unix_stream_shortsend_accept_loop
                     remove_listener = true;
                 }
                 Ok(wrote) if wrote > 0 => {
-                    eprintln!("unix stream send buffer is too small to send the {} bytes of {} in one go o_0, stopping TCP {}",
+                    eprintln!(
+                        "unix stream send buffer is too small to send the {} bytes of {} in one go o_0, stopping unix stream {}",
                         msg.len(), stream.service_name, service_name
                     );
                     remove_listener = true;
@@ -89,6 +92,48 @@ fn unix_stream_shortsend_accept_loop
             None
         },
         |_, (), _| unreachable!("{} unix stream connections cannot be stored", service_name)
+    );
+    if remove_listener {
+        Remove
+    } else {
+        accept_result
+    }
+}
+
+#[cfg(feature="seqpacket")]
+fn unix_seqpacket_shortsend_accept_loop(
+    listener: &UnixSeqpacketListener,  server: &mut Server,
+    service_name: &'static &'static str,  msg: &[u8]
+) -> EntryStatus {
+    let mut remove_listener = false;
+    let accept_result = unix_seqpacket_accept_loop(listener, server, service_name, Ready::writable(),
+        |conn| {
+            match conn.send(msg) {
+                Ok(wrote) if wrote == msg.len() => conn.end(Ok(0), "/*print unreachable*/"),
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    eprintln!(
+                        "unix seqpacket send buffer appears to have zero capacity! stopping TCP {}",
+                        conn.service_name
+                    );
+                    remove_listener = true;
+                }
+                Ok(wrote) if wrote > 0 => {
+                    eprintln!(
+                        "unix seqpacket send buffer is too small to send the {}-bytes packet of {}, stopping seqpacket {}",
+                        msg.len(), conn.service_name, service_name
+                    );
+                    remove_listener = true;
+                }
+                closing => {
+                    eprintln!("udsq://{:?} managed to close the connection before we could send the {} bytes of {}",
+                        conn.addr, msg.len(), service_name
+                    );
+                    conn.end(closing, &format!("sending {}", service_name));
+                }
+            }
+            None
+        },
+        |_, (), _| unreachable!("{} unix seqpacket connections cannot be stored", service_name)
     );
     if remove_listener {
         Remove
@@ -187,6 +232,8 @@ pub enum QotdSocket {
         UnixSocketWrapper<UnixDatagram>,
         Box<(Vec<UnixSocketAddr>/*doesn't implement Hash*/, QuoteDb, u32)>
     ),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketListener(UnixSocketWrapper<UnixSeqpacketListener>, QuoteDb, u32),
     #[cfg(feature="posixmq")]
     PosixMq(PosixMqWrapper, QuoteDb, u32),
 }
@@ -197,7 +244,7 @@ fn read_qotes(path: &Path) -> QuoteDb {
         Ok(file) => file,
         Err(e) => {
             if e.kind() == ErrorKind::NotFound {
-                eprintln!("No QOTD file {:?}. Seending fallback quote instead", path);
+                eprintln!("No QOTD file {:?}. Sending fallback quote instead", path);
             } else {
                 eprintln!("Cannot read {:?}: {}. Sending fallback quote instead", path, e);
             }
@@ -273,6 +320,10 @@ impl QotdSocket {
                 ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, state))
             }
         );
+        #[cfg(feature="seqpacket")]
+        UnixSocketWrapper::create_seqpacket_listener("qotd", server, &mut|listener, Token(_)| {
+            ServiceSocket::Qotd(QotdSocket::UnixSeqpacketListener(listener, quotes.clone(), 0))
+        });
         #[cfg(feature="posixmq")]
         listen_posixmq(server, "qotd", Ready::writable(),
             posixmq::OpenOptions::writeonly()
@@ -303,6 +354,18 @@ impl QotdSocket {
                         server,
                         &"qotd",
                         &quotes[*pos as usize]
+                );
+                *pos += 1;
+                *pos %= quotes.len() as u32;
+                status
+            }
+            #[cfg(feature="seqpacket")]
+            &mut QotdSocket::UnixSeqpacketListener(ref listener, ref quotes, ref mut pos) => {
+                let status = unix_seqpacket_shortsend_accept_loop(
+                    listener,
+                    server,
+                    &"qotd",
+                    &quotes[*pos as usize]
                 );
                 *pos += 1;
                 *pos %= quotes.len() as u32;
@@ -360,6 +423,8 @@ impl QotdSocket {
             &QotdSocket::UnixStreamListener(ref listener, _, _) => Some(&**listener),
             #[cfg(unix)]
             &QotdSocket::UnixDatagram(ref socket, _) => Some(&**socket),
+            #[cfg(feature="seqpacket")]
+            &QotdSocket::UnixSeqpacketListener(ref listener, _, _) => Some(&**listener),
             #[cfg(feature="posixmq")]
             &QotdSocket::PosixMq(ref mq, _, _) => Some(&**mq),
         }
@@ -377,6 +442,8 @@ pub enum Time32Socket {
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketListener(UnixSocketWrapper<UnixSeqpacketListener>),
 }
 
 fn new_time32() -> [u8;4] {
@@ -426,6 +493,10 @@ impl Time32Socket {
                 ServiceSocket::Time32(Time32Socket::UnixDatagram(socket, Vec::new()))
             }
         );
+        #[cfg(feature="seqpacket")]
+        UnixSocketWrapper::create_seqpacket_listener("time32", server, &mut|listener, Token(_)| {
+            ServiceSocket::Time32(Time32Socket::UnixSeqpacketListener(listener))
+        });
     }
 
     pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
@@ -437,6 +508,10 @@ impl Time32Socket {
             #[cfg(unix)]
             &mut Time32Socket::UnixStreamListener(ref listener) => {
                 unix_stream_shortsend_accept_loop(listener, server, &"time32", &sometime)
+            }
+            #[cfg(feature="seqpacket")]
+            &mut Time32Socket::UnixSeqpacketListener(ref listener) => {
+                unix_seqpacket_shortsend_accept_loop(listener, server, &"time32", &sometime)
             }
             &mut Time32Socket::Udp(ref socket, ref mut outstanding) => {
                 udp_shortsend(socket, server, "time32", readiness, outstanding, &sometime)
@@ -456,6 +531,8 @@ impl Time32Socket {
             &Time32Socket::UnixStreamListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
             &Time32Socket::UnixDatagram(ref socket, _) => Some(&**socket),
+            #[cfg(feature="seqpacket")]
+            &Time32Socket::UnixSeqpacketListener(ref listener) => Some(&**listener),
         }
     }
 }
@@ -471,6 +548,8 @@ pub enum DaytimeSocket {
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketListener(UnixSocketWrapper<UnixSeqpacketListener>),
 }
 
 /// Cet the current time in some^* timezone.
@@ -529,6 +608,10 @@ impl DaytimeSocket {
                 ServiceSocket::Daytime(DaytimeSocket::UnixDatagram(socket, Vec::new()))
             }
         );
+        #[cfg(feature="seqpacket")]
+        UnixSocketWrapper::create_seqpacket_listener("daytime", server, &mut|listener, Token(_)| {
+            ServiceSocket::Daytime(DaytimeSocket::UnixSeqpacketListener(listener))
+        });
     }
 
     pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
@@ -540,6 +623,10 @@ impl DaytimeSocket {
             #[cfg(unix)]
             &mut DaytimeSocket::UnixStreamListener(ref listener) => {
                 unix_stream_shortsend_accept_loop(listener, server, &"time32", &somewhere)
+            }
+            #[cfg(feature="seqpacket")]
+            &mut DaytimeSocket::UnixSeqpacketListener(ref listener) => {
+                unix_seqpacket_shortsend_accept_loop(listener, server, &"time32", &somewhere)
             }
             &mut DaytimeSocket::Udp(ref socket, ref mut outstanding) => {
                 udp_shortsend(socket, server, "time32", readiness, outstanding, &somewhere)
@@ -559,6 +646,8 @@ impl DaytimeSocket {
             &DaytimeSocket::UnixStreamListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
             &DaytimeSocket::UnixDatagram(ref socket, _) => Some(&**socket),
+            #[cfg(feature="seqpacket")]
+            &DaytimeSocket::UnixSeqpacketListener(ref listener) => Some(&**listener),
         }
     }
 }

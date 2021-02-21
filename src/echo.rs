@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::rc::Rc;
+#[cfg(feature="seqpacket")]
+use std::io::IoSlice;
 #[cfg(unix)]
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
@@ -9,12 +11,40 @@ use mio::{IoVec, Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
+#[cfg(feature="seqpacket")]
+use uds::nonblocking::UnixSeqpacketListener;
 
 use crate::Server;
 use crate::ServiceSocket;
 use crate::helpers::*;
 
 const ECHO_PORT: u16 = 7; // read and write
+
+#[cfg(feature="seqpacket")]
+/// State of an unix domain seqpacket connection
+#[derive(Debug, Default)]
+pub struct EchoSeqpacketConnState {
+    /// Size of each received packet that has not been sent back yet.
+    ///
+    /// Size is not usize because the receive buffer is much smaller than 4 GB.
+    unsent_packets: VecDeque<u32>,
+    /// Stores the unsent received bytes to echo
+    content_buf: VecDeque<u8>,
+    /// Implements sending each received packet twice
+    ///
+    /// Is toggled after a packet is sent,
+    /// and only if it was true is unsent_packets popped and content_buf drained.
+    /// Starts out as false from the derived Default impl.
+    sent_once: bool,
+    /// Signal that end of connection has been reached.
+    ///
+    /// Is set to true when recv() has returned Ok(0) two times in a row.
+    /// (two recv()s are required as Ok(0) can also signal an empty packet.)
+    /// After this, the connection will be closed after all unsent packets
+    /// have been sent.
+    recv_shutdown: bool,
+    last_was_empty: bool,
+}
 
 #[derive(Debug)]
 pub enum EchoSocket {
@@ -25,6 +55,10 @@ pub enum EchoSocket {
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixStreamConn(UnixStreamWrapper, VecDeque<u8>, bool),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketListener(UnixSocketWrapper<UnixSeqpacketListener>),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketConn(UnixSeqpacketConnWrapper, EchoSeqpacketConnState),
     #[cfg(unix)]
     UnixDatagram(UnixSocketWrapper<UnixDatagram>, VecDeque<(UnixSocketAddr,Rc<[u8]>)>),
 }
@@ -147,6 +181,88 @@ fn unix_stream_echo(conn: &mut UnixStreamWrapper,  unsent: &mut VecDeque<u8>,
     }
 }
 
+#[cfg(feature="seqpacket")]
+fn unix_seqpacket_echo(
+        conn: &mut UnixSeqpacketConnWrapper,
+        state: &mut EchoSeqpacketConnState,
+        buffer: &mut[u8],
+        readiness: Ready
+) -> EntryStatus {
+    if !state.recv_shutdown && readiness.is_readable() {
+        loop {
+            match conn.recv(buffer) {
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                Ok((len, truncated)) if len > 0 => {
+                    if state.last_was_empty {
+                        state.unsent_packets.push_back(0);
+                        state.last_was_empty = false;
+                    }
+                    if truncated {
+                        eprintln!(
+                            "{} echo udsq://{} received packet was truncated",
+                            now(), conn.addr
+                        );
+                    }
+                    state.unsent_packets.push_back(len as u32);
+                    state.content_buf.extend(&buffer[..len]);
+                }
+                Ok((0, _)) => {
+                    if state.last_was_empty {
+                        state.recv_shutdown = true;
+                        break;
+                    } else {
+                        state.last_was_empty = true;
+                    }
+                }
+                end => {
+                    conn.end(end.map(|(bytes, _)| bytes ), "receiving bytes to echo");
+                    return Remove;
+                }
+            }
+        }
+    }
+    while let Some(&packet_size) = state.unsent_packets.front() {
+        let parts = match state.content_buf.as_slices() {
+            (contigious, _) if contigious.len() >= packet_size as usize => [
+                IoSlice::new(&contigious[..packet_size as  usize]),
+                IoSlice::new(&[]),
+            ],
+            (first, second) => [
+                IoSlice::new(first),
+                IoSlice::new(&second[..(packet_size as usize - first.len())]),
+            ],
+        };
+        match conn.send_vectored(&parts) {
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+            Ok(sent @ 1..=std::usize::MAX) => {
+                if sent < packet_size as usize {
+                    eprintln!(
+                        "{} echo udsq://{} sent packet was truncated to {} of {} bytes",
+                        now(), conn.addr, sent, packet_size
+                    );
+                }
+                if state.sent_once {
+                    state.unsent_packets.pop_front();
+                    state.content_buf.drain(..packet_size as usize).for_each(|_| {} );
+                    state.sent_once = false;
+                } else {
+                    state.sent_once = true;
+                }
+            }
+            end => {
+                conn.end(end, "echoing");
+                return Remove;
+            }
+        }
+    }
+    if state.recv_shutdown && state.unsent_packets.is_empty() {
+        conn.shutdown(Shutdown::Both);
+        Remove
+    } else {
+        Drained
+    }
+}
+
 use self::EchoSocket::*;
 
 impl EchoSocket {
@@ -160,6 +276,10 @@ impl EchoSocket {
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("echo", server,
             &mut|listener, Token(_)| ServiceSocket::Echo(UnixStreamListener(listener))
+        );
+        #[cfg(feature="seqpacket")]
+        UnixSocketWrapper::create_seqpacket_listener("echo", server,
+            &mut|listener, Token(_)| ServiceSocket::Echo(UnixSeqpacketListener(listener))
         );
         #[cfg(unix)]
         UnixSocketWrapper::create_datagram_socket("echo", Ready::all(), server,
@@ -258,6 +378,20 @@ impl EchoSocket {
             &mut UnixStreamConn(ref mut conn, ref mut unsent, ref mut read_shutdown) => {
                 unix_stream_echo(conn, unsent, read_shutdown, &mut server.buffer, readiness)
             }
+            #[cfg(feature="seqpacket")]
+            &mut UnixSeqpacketListener(ref listener) => {
+                unix_seqpacket_accept_loop(listener, server, &"echo", Ready::all(),
+                    |_| Some(()),
+                    |conn, (), Token(_)| {
+                        let clean_state = EchoSeqpacketConnState::default();
+                        ServiceSocket::Echo(UnixSeqpacketConn(conn, clean_state))
+                    }
+                )
+            }
+            #[cfg(feature="seqpacket")]
+            &mut UnixSeqpacketConn(ref mut conn, ref mut state) => {
+                unix_seqpacket_echo(conn, state, &mut server.buffer, readiness)
+            }
         }
     }
 
@@ -268,10 +402,14 @@ impl EchoSocket {
             &TcpConn(ref conn, _, _) => Some(&**conn),
             #[cfg(unix)]
             &UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(feature="seqpacket")]
+            &UnixSeqpacketListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
             &UnixDatagram(ref socket, _) => Some(&**socket),
             #[cfg(unix)]
             &UnixStreamConn(ref conn, _, _) => Some(&**conn),
+            #[cfg(feature="seqpacket")]
+            &UnixSeqpacketConn(ref conn, _) => Some(&**conn),
         }
     }
 }

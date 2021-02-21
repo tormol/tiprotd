@@ -12,6 +12,8 @@ use mio::net::{TcpListener, UdpSocket};
 use mio::{PollOpt, Poll};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
+#[cfg(feature="seqpacket")]
+use uds::nonblocking::UnixSeqpacketListener;
 
 use crate::Server;
 use crate::ServiceSocket;
@@ -136,6 +138,10 @@ pub enum DiscardSocket {
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
     UnixStreamConn(UnixStreamWrapper),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketListener(UnixSocketWrapper<UnixSeqpacketListener>),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketConn(UnixSeqpacketConnWrapper, bool),
     #[cfg(unix)]
     UnixDatagram(UnixSocketWrapper<UnixDatagram>),
     #[cfg(unix)]
@@ -176,6 +182,10 @@ impl DiscardSocket {
         );
         #[cfg(unix)]
         create_and_register_pipe("discard.pipe", server);
+        #[cfg(feature="seqpacket")]
+        UnixSocketWrapper::create_seqpacket_listener("discard", server,
+            &mut|listener, Token(_)| ServiceSocket::Discard(UnixSeqpacketListener(listener))
+        );
         #[cfg(feature="posixmq")]
         listen_posixmq(server, "discard", Ready::readable(),
             posixmq::OpenOptions::readonly()
@@ -242,6 +252,47 @@ impl DiscardSocket {
                     }
                 }
             }
+            #[cfg(feature="seqpacket")]
+            &mut UnixSeqpacketListener(ref mut listener) => {
+                unix_seqpacket_accept_loop(listener, server, &"discard", Ready::readable(),
+                    |conn| {conn.shutdown(Shutdown::Write); Some(())}, // likely long-lived
+                    |conn, (), Token(_)| ServiceSocket::Discard(UnixSeqpacketConn(conn, false))
+                )
+            }
+            #[cfg(feature="seqpacket")]
+            &mut UnixSeqpacketConn(ref mut conn, ref mut last_was_empty) => {
+                loop {
+                    match conn.recv(&mut server.buffer) {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                            break Drained
+                        }
+                        Ok((len, truncated)) if len > 0 => {
+                            if *last_was_empty {
+                                anti_discard(&conn.addr, "udsq", &[]);
+                                *last_was_empty = false;
+                            }
+                            if truncated {
+                                eprintln!(
+                                    "{} udsq://{} received packet was truncated",
+                                    now(), conn.addr,
+                                );
+                            }
+                            anti_discard(&conn.addr, "udsq", &server.buffer[..len]);
+                        }
+                        end => {
+                            if *last_was_empty {
+                                conn.end(
+                                    end.map(|(bytes, _)| bytes ),
+                                    "receiving bytes to discard"
+                                );
+                                break Remove;
+                            } else {
+                                *last_was_empty = true;
+                            }
+                        }
+                    }
+                }
+            }
             #[cfg(unix)]
             &mut UnixDatagram(ref socket) => {
                 loop {
@@ -303,10 +354,14 @@ impl DiscardSocket {
             &TcpConn(ref conn) => Some(&**conn),
             #[cfg(unix)]
             &UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(feature="seqpacket")]
+            &UnixSeqpacketListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
             &UnixDatagram(ref socket) => Some(&**socket),
             #[cfg(unix)]
             &UnixStreamConn(ref conn) => Some(&**conn),
+            #[cfg(feature="seqpacket")]
+            &UnixSeqpacketConn(ref conn, _) => Some(&**conn),
             #[cfg(unix)]
             &NamedPipe(ref pipe) => Some(pipe),
             #[cfg(feature="posixmq")]

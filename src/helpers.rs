@@ -10,13 +10,15 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::SocketAddr as UnixSocketAddr;
 #[cfg(unix)]
-use std::os::raw::{c_int, c_char};
+use std::os::raw::c_int;
 
 use chrono::Local;
 use mio::{Evented, PollOpt, Ready, Token};
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(unix)]
 use mio_uds::{UnixListener, UnixStream, UnixDatagram};
+#[cfg(feature="seqpacket")]
+use uds::nonblocking::{UnixSeqpacketListener, UnixSeqpacketConn};
 #[cfg(unix)]
 use nix::sys::socket::{getsockopt, setsockopt, sockopt::*};
 #[cfg(unix)]
@@ -595,39 +597,6 @@ impl UnixSocketWrapper<UnixListener> {
                 .expect("Cannot register unix stream listener");
             entry.insert(encapsulate(socket, token));
         }
-        Self::create_seqpacket_listener(service_name, server, encapsulate);
-    }
-
-    pub fn create_seqpacket_listener(service_name: &str,  server: &mut Server,
-            encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
-    ) {
-        let on = format!("{}_seqpacket.socket", service_name);
-        let res = Self::create(on, server, |path| {
-            let mut sockbuf = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-            sockbuf.sun_family = libc::AF_UNIX as libc::sa_family_t;
-            if path.len() > std::mem::size_of_val(&sockbuf.sun_path) {
-                return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
-            }
-            for (byte, dst) in path.bytes().zip(&mut sockbuf.sun_path[..]) {
-                *dst = byte as c_char;
-            }
-            let sockaddr = unsafe { &*(&sockbuf as *const _ as *const libc::sockaddr) };
-            let offset = &sockbuf.sun_path as *const _ as usize - &sockbuf as *const _ as usize;
-            let socklen = offset as libc::socklen_t + path.len() as libc::socklen_t;
-            let listener = create_incoming_socket(Protocol::Udsq,
-                    libc::SOCK_SEQPACKET, 0,
-                    &sockaddr, socklen,
-                    None, false, Some(10/*FIXME*/),
-            )?;
-            Ok(unsafe { UnixListener::from_raw_fd(listener) })
-        });
-        if let Some(socket) = res {
-            let entry = server.sockets.vacant_entry();
-            let token = Token(entry.key());
-            server.poll.register(&*socket, token, Ready::readable(), PollOpt::edge())
-                .expect("Cannot register unix seqpacket listener");
-            entry.insert(encapsulate(socket, token));
-        }
     }
 }
 #[cfg(unix)]
@@ -641,6 +610,24 @@ impl UnixSocketWrapper<UnixDatagram> {
             let token = Token(entry.key());
             server.poll.register(&*socket, token, poll_for, PollOpt::edge())
                 .expect("Cannot register unix datagram socket");
+            entry.insert(encapsulate(socket, token));
+        }
+    }
+}
+#[cfg(feature="seqpacket")]
+impl UnixSocketWrapper<UnixSeqpacketListener> {
+    pub fn create_seqpacket_listener(service_name: &str,  server: &mut Server,
+        encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
+    ) {
+        let on = format!("{}_seqpacket.socket", service_name);
+        let res = Self::create(on, server, |path| {
+            UnixSeqpacketListener::bind(&path)
+        });
+        if let Some(socket) = res {
+            let entry = server.sockets.vacant_entry();
+            let token = Token(entry.key());
+            server.poll.register(&*socket, token, Ready::readable(), PollOpt::edge())
+                .expect("Cannot register unix seqpacket listener");
             entry.insert(encapsulate(socket, token));
         }
     }
@@ -777,6 +764,104 @@ impl Deref for UnixStreamWrapper {
 impl DerefMut for UnixStreamWrapper {
     fn deref_mut(&mut self) -> &mut UnixStream {
         &mut self.stream
+    }
+}
+
+
+#[cfg(feature="seqpacket")]
+pub fn unix_seqpacket_accept_loop<
+        P,
+        T: FnMut(&mut UnixSeqpacketConnWrapper) -> Option<P>,
+        W: FnMut(UnixSeqpacketConnWrapper, P, Token) -> ServiceSocket
+>(
+        listener: &UnixSeqpacketListener,  server: &mut Server,
+        service_name: &'static &'static str,  poll_stream_for: Ready,
+        mut trier: T,  mut wrapper: W
+) -> EntryStatus {
+    loop {
+        match listener.accept_unix_addr() {
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Drained,
+            Err(ref e) if e.kind() == ErrorKind::ConnectionAborted => continue,
+            Err(ref e) if e.kind() == ErrorKind::ConnectionRefused => continue,
+            Err(ref e) if e.kind() == ErrorKind::ConnectionReset => continue,
+            Err(e) => {
+                eprintln!("Error accepting {} unix seqpacket connection: {}", service_name, e);
+                // non-remote error, close the socket
+                // this allows EMFILE or ENFILE DoS attack, but unix sockets aren't important
+                return Remove;
+            }
+            Ok((conn, addr)) => {
+                let mut conn = UnixSeqpacketConnWrapper{conn, addr, service_name};
+                eprintln!("{} {} udsq://{} connection established",
+                    now(), service_name, conn.addr
+                );
+                if let Some(state) = trier(&mut conn) {
+                    let entry = server.sockets.vacant_entry();
+                    let result = server.poll.register(
+                        &*conn,
+                        Token(entry.key()),
+                        poll_stream_for,
+                        PollOpt::edge(),
+                    );
+                    if let Err(e) = result {
+                        eprintln!("Cannot register unix seqpacket connection: {}", e);
+                    } else {
+                        let token = Token(entry.key()); // make borrowck happy
+                        entry.insert(wrapper(conn, state, token));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature="seqpacket")]
+#[derive(Debug)]
+pub struct UnixSeqpacketConnWrapper {
+    conn: UnixSeqpacketConn,
+    pub addr: uds::UnixSocketAddr,
+    pub service_name: &'static &'static str,
+}
+#[cfg(feature="seqpacket")]
+impl Drop for UnixSeqpacketConnWrapper {
+    fn drop(&mut self) {
+        eprintln!("{} {} udsq://{} connection closed",
+            now(), self.service_name, self.addr
+        );
+        // socket deregisters itself from mio
+    }
+}
+#[cfg(feature="seqpacket")]
+impl UnixSeqpacketConnWrapper {
+    pub fn shutdown(&self,  direction: Shutdown) -> bool {
+        if let Err(e) = self.conn.shutdown(direction) {
+            eprintln!("udsq://{} error shutting down {}{} socket: {}",
+                self.addr, shutdown_direction(direction), self.service_name, e
+            );
+            true
+        } else {
+            false
+        }
+    }
+    pub fn end(&self,  cause: Result<usize,io::Error>,  operation: &str) {
+        if let Err(e) = cause {
+            eprintln!("udsq://{} error {}: {}, closing", self.addr, operation, e);
+        } else {
+            self.shutdown(Shutdown::Both);
+        }
+    }
+}
+#[cfg(feature="seqpacket")]
+impl Deref for UnixSeqpacketConnWrapper {
+    type Target = UnixSeqpacketConn;
+    fn deref(&self) -> &UnixSeqpacketConn {
+        &self.conn
+    }
+}
+#[cfg(feature="seqpacket")]
+impl DerefMut for UnixSeqpacketConnWrapper {
+    fn deref_mut(&mut self) -> &mut UnixSeqpacketConn {
+        &mut self.conn
     }
 }
 
