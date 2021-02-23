@@ -191,9 +191,9 @@ dependencies = [
 
 [[package]]
 name = "posixmq"
-version = "0.2.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2dbe23bcfc809221c25982bd3c6e5ec38485181af239d7f39e4af9d91824c8b7"
+checksum = "e5e01860c5a0b0c823066268fb7950019bac142c1cb8919e774823fe510e697a"
 dependencies = [
  "libc",
  "mio",

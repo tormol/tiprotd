@@ -654,7 +654,7 @@ impl Deref for PosixMqWrapper {
 #[cfg(feature="posixmq")]
 impl Drop for PosixMqWrapper {
     fn drop(&mut self) {
-        if let Err(e) = posixmq::unlink(self.1) {
+        if let Err(e) = posixmq::remove_queue(self.1) {
             eprintln!("Error removing posix message queue /{}: {}", self.1, e);
         }
     }

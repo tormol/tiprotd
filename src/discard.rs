@@ -357,7 +357,7 @@ impl DiscardSocket {
             #[cfg(feature="posixmq")]
             &mut PosixMq(ref mq) => {
                 loop {
-                    match mq.receive(&mut server.buffer) {
+                    match mq.recv(&mut server.buffer) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break Drained,
                         Err(e) => {
                             eprintln!("Error receiving from posix message queue /discard: {}, removing it.", e);

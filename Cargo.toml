@@ -11,7 +11,7 @@ mio = "0.6"
 udplite = {version="0.1", features=["mio_06"], optional=true}
 mio-uds = "0.6.7"
 uds = {version="0.2.2", features=["mio"], optional=true}
-posixmq = {version="0.2", features=["mio"], optional=true}
+posixmq = {version="1.0", features=["mio_06"], optional=true}
 slab = "0.4"
 chrono = "0.4"
 rand = "0.7"
