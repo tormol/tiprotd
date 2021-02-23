@@ -15,6 +15,8 @@ use std::os::raw::c_int;
 use chrono::Local;
 use mio::{Evented, PollOpt, Ready, Token};
 use mio::net::{TcpListener, TcpStream, UdpSocket};
+#[cfg(any(target_os="linux", target_os="android", target_os="freebsd"))]
+use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use mio_uds::{UnixListener, UnixStream, UnixDatagram};
 #[cfg(feature="seqpacket")]
@@ -60,7 +62,7 @@ impl Protocol {
     pub fn description(self) -> &'static str {
         [
             "unknown",
-            "TCP", "UDP", "SCTP", "UDPlite", "DCCP",
+            "TCP", "UDP", "SCTP", "UDP-lite", "DCCP",
             "unix stream", "unix datagram", "unix seqpacket",
             "posix message queue", "pipe",
         ][self as u8 as usize]
@@ -489,8 +491,6 @@ pub fn listen_udp(server: &mut Server,  service_name: &'static str,
     ).unwrap_or_else(|| std::process::exit(1) );
     let token = Token(entry.key()); // make borrowck happy
     entry.insert(encapsulate(socket, token));
-    #[cfg(feature="udplite")]
-    listen_udplite(server, service_name, port, poll_for, encapsulate);
 }
 
 
@@ -498,39 +498,30 @@ pub fn listen_udp(server: &mut Server,  service_name: &'static str,
 /// bound to the specified port and register it.
 #[cfg(feature="udplite")]
 pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
-        port: u16,  poll_for: Ready,
-        encapsulate: &mut dyn FnMut(UdpSocket, Token)->ServiceSocket
+        port: u16,  poll_for: Ready,  send_cscov: Option<u16>,
+        encapsulate: &mut dyn FnMut(UdpLiteSocket, Token)->ServiceSocket
 ) {
-    let (socket, entry) = server.try_bind_ip("udplite", service_name, port, poll_for,
-        |addr| {
-            use std::os::raw::c_void;
-            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
-            let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
-            let socket = create_incoming_socket(Protocol::Udplite,
-                    libc::SOCK_DGRAM, libc::IPPROTO_UDPLITE,
-                    sockaddr, socklen,
-                    Some(0), false, None,
-            )?;
-            #[cfg(target_os="linux")]
-            const UDPLITE_SEND_CSCOV: c_int = 10;
-            #[cfg(target_os="linux")]
-            const UDPLITE_RECV_CSCOV: c_int = 11;
-            let ret = unsafe { libc::setsockopt(socket,
-                    libc::IPPROTO_UDPLITE,
-                    UDPLITE_SEND_CSCOV,
-                    &8 as *const c_int as *const c_void,
-                    std::mem::size_of::<c_int>() as libc::socklen_t
-            ) };
-            if ret != 0 {
-                eprintln!("Connot set UDPLITE_SEND_CSCOV for udplite://{}: {}, continuing anyway.",
-                    addr, io::Error::last_os_error()
+    let result = server.try_bind_ip("udplite", service_name, port, poll_for,
+        |addr| UdpLiteSocket::bind_nonblocking(&addr)
+    );
+    if let Some((socket, entry)) = result {
+        if let Err(e) = socket.set_recv_checksum_coverage_filter(Some(0)) {
+            eprintln!(
+                "Cannot disable UDP-lite checksum coverage filter for {}: {}",
+                service_name, e
+            );
+        }
+        if let Some(coverage) = send_cscov {
+            if let Err(e) = socket.set_send_checksum_coverage(Some(coverage)) {
+                eprintln!(
+                    "Cannot set {} UDP-lite sent checksum coverage to {}: {}",
+                    service_name, coverage, e
                 );
             }
-            unsafe { Ok(UdpSocket::from_raw_fd(socket)) }
         }
-    ).unwrap_or_else(|| std::process::exit(1) );
-    let token = Token(entry.key());
-    entry.insert(encapsulate(socket, token));
+        let token = Token(entry.key());
+        entry.insert(encapsulate(socket, token));
+    }
 }
 
 
@@ -885,18 +876,56 @@ pub fn udp_receive<F: FnMut(usize, SocketAddr, &mut Server)>
     }
 }
 
-
 /// returns false if a WouldBlock error was returned, and logs errors
 pub fn udp_send(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  service_name: &str) -> bool {
     match from.send_to(msg, to) {
         Err(ref e) if e.kind() == ErrorKind::WouldBlock => return false,
         Err(e) => {
-            eprintln!("error sending udp packet ({}, udp://{}): {}",
+            eprintln!("error sending UDP packet ({}, udp://{}): {}",
                 service_name, native_addr(*to), e
             );
         }
         Ok(len) if len != msg.len() => {
             eprintln!("udp://{} could only send {}/{} bytes of {} response",
+                native_addr(*to), len, msg.len(), service_name
+            );
+        },
+        Ok(_) => {}
+    }
+    true
+}
+
+
+pub fn udplite_receive<F: FnMut(usize, SocketAddr, &mut Server)>
+(socket: &UdpLiteSocket,  server: &mut Server,  service_name: &str,  mut f: F)
+-> EntryStatus {
+    loop {
+        match socket.recv_from(&mut server.buffer) {
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Drained,
+            Ok((len, from)) => f(len, from, server),
+            // ignore errors caused by previous sends
+            Err(ref e) if e.kind() == ErrorKind::ConnectionRefused => {},
+            Err(ref e) if e.kind() == ErrorKind::ConnectionReset => {},
+            Err(ref e) if e.kind() == ErrorKind::ConnectionAborted => {},
+            Err(e) => {
+                eprintln!("{} {} UDP-lite receive error: {}", now(), service_name, e);
+                return Remove;
+            }
+        }
+    }
+}
+
+/// returns false if a WouldBlock error was returned, and logs errors
+pub fn udplite_send(from: &UdpLiteSocket,  msg: &[u8],  to: &SocketAddr,  service_name: &str) -> bool {
+    match from.send_to(msg, to) {
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => return false,
+        Err(e) => {
+            eprintln!("error sending UDP-lite packet ({}, udplite://{}): {}",
+                service_name, native_addr(*to), e
+            );
+        }
+        Ok(len) if len != msg.len() => {
+            eprintln!("udplite://{} could only send {}/{} bytes of {} response",
                 native_addr(*to), len, msg.len(), service_name
             );
         },

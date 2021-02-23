@@ -19,6 +19,8 @@ extern crate chrono;
 extern crate rand;
 extern crate slab;
 extern crate mio;
+#[cfg(feature="udplite")]
+extern crate udplite;
 #[cfg(unix)]
 extern crate mio_uds;
 #[cfg(feature="seqpacket")]

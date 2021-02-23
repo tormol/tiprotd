@@ -10,6 +10,8 @@ use mio::{Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(unix)]
 use mio::{PollOpt, Poll};
+#[cfg(feature="udplite")]
+use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
@@ -134,6 +136,8 @@ pub enum DiscardSocket {
     TcpListener(TcpListener),
     TcpConn(TcpStreamWrapper),
     Udp(UdpSocket),
+    #[cfg(feature="udplite")]
+    UdpLite(UdpLiteSocket),
     #[cfg(unix)]
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
@@ -171,6 +175,10 @@ impl DiscardSocket {
         );
         listen_udp(server, "discard", DISCARD_PORT, Ready::readable(),
             &mut|socket, Token(_)| ServiceSocket::Discard(Udp(socket))
+        );
+        #[cfg(feature="udplite")]
+        listen_udplite(server, "discard", DISCARD_PORT, Ready::readable(), None,
+            &mut|socket, Token(_)| ServiceSocket::Discard(UdpLite(socket))
         );
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("discard", server,
@@ -228,6 +236,21 @@ impl DiscardSocket {
                         }
                         Ok((len, from)) => {
                             anti_discard(&native_addr(from), "udp", &server.buffer[..len]);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature="udplite")]
+            &mut UdpLite(ref socket) => {
+                loop {
+                    match socket.recv_from(&mut server.buffer) {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break Drained,
+                        Err(e) => {
+                            eprintln!("{} discard UDP-lite error: {}", now(), e);
+                            break Remove; // some errors should probably be ignored, but see what happens
+                        }
+                        Ok((len, from)) => {
+                            anti_discard(&native_addr(from), "udplite", &server.buffer[..len]);
                         }
                     }
                 }
@@ -351,6 +374,8 @@ impl DiscardSocket {
         match self {
             &TcpListener(ref listener) => Some(listener),
             &Udp(ref socket) => Some(socket),
+            #[cfg(feature="udplite")]
+            &UdpLite(ref socket) => Some(socket),
             &TcpConn(ref conn) => Some(&**conn),
             #[cfg(unix)]
             &UnixStreamListener(ref listener) => Some(&**listener),

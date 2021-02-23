@@ -10,6 +10,8 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
 use mio::{Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
+#[cfg(feature="udplite")]
+use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
@@ -179,6 +181,43 @@ fn udp_shortsend(
     Drained
 }
 
+fn udplite_shortsend(
+    socket: &UdpLiteSocket,
+    server: &mut Server,
+    service_name: &str,
+    readiness: Ready,
+    outstanding: &mut HashSet<SocketAddr>,
+    msg: &[u8]
+) -> EntryStatus {
+    if readiness.is_readable() {
+        loop {
+            match socket.recv_from(&mut server.buffer) {
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
+                // send errors might be returned on the next read
+                Err(e) => eprintln!("UDP-lite {} error (on receive): {}", service_name, e),
+                Ok((len, from)) => {
+                    if server.limits.allow_unacknowledged_send(from, msg.len()) {
+                        eprintln!("{} udplite://{} sends {} bytes for {}",
+                            now(), native_addr(from), len, service_name
+                        );
+                        // little copying involved, so don't bother sending directly
+                        outstanding.insert(from);
+                    }
+                }
+            }
+        }
+    }
+    // TODO try sendmmsg where available
+    while let Some(&addr) = outstanding.iter().next() {
+        if udplite_send(socket, msg, &addr, service_name) {
+            let _ = outstanding.remove(&addr);
+        } else {
+            break;
+        }
+    }
+    Drained
+}
+
 #[cfg(unix)]
 fn unix_datagram_shortsend(
         socket: &UnixDatagram,
@@ -225,6 +264,8 @@ type QuoteDb = Rc<[Box<[u8]>]>;
 pub enum QotdSocket {
     TcpListener(TcpListener, QuoteDb, u32),
     Udp(UdpSocket, HashSet<SocketAddr>, QuoteDb, u32),
+    #[cfg(feature="udplite")]
+    UdpLite(UdpLiteSocket, HashSet<SocketAddr>, QuoteDb, u32),
     #[cfg(unix)]
     UnixStreamListener(UnixSocketWrapper<UnixListener>, QuoteDb, u32),
     #[cfg(unix)]
@@ -309,6 +350,12 @@ impl QotdSocket {
                 ServiceSocket::Qotd(QotdSocket::Udp(socket, HashSet::new(), quotes.clone(), 0))
             }
         );
+        #[cfg(feature="udplite")]
+        listen_udplite(server, "qotd", QOTD_PORT, Ready::readable() | Ready::writable(), Some(0),
+            &mut|socket, Token(_)| {
+                ServiceSocket::Qotd(QotdSocket::UdpLite(socket, HashSet::new(), quotes.clone(), 0))
+            }
+        );
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("qotd", server, &mut|listener, Token(_)| {
             ServiceSocket::Qotd(QotdSocket::UnixStreamListener(listener, quotes.clone(), 0))
@@ -384,6 +431,20 @@ impl QotdSocket {
                 *pos %= quotes.len() as u32;
                 status
             }
+            #[cfg(feature="udplite")]
+            &mut QotdSocket::UdpLite(ref socket, ref mut outstanding, ref quotes, ref mut pos) => {
+                let status = udplite_shortsend(
+                    socket,
+                    server,
+                    "qotd",
+                    readiness,
+                    outstanding,
+                    &quotes[*pos as usize]
+                );
+                *pos += 1;
+                *pos %= quotes.len() as u32;
+                status
+            }
             #[cfg(unix)]
             &mut QotdSocket::UnixDatagram(ref socket, ref mut boxed) => {
                 let tuple: &mut(_, _, _) = &mut*boxed;
@@ -419,6 +480,8 @@ impl QotdSocket {
         match self {
             &QotdSocket::TcpListener(ref listener, _, _) => Some(listener),
             &QotdSocket::Udp(ref socket, _, _, _) => Some(socket),
+            #[cfg(feature="udplite")]
+            &QotdSocket::UdpLite(ref socket, _, _, _) => Some(socket),
             #[cfg(unix)]
             &QotdSocket::UnixStreamListener(ref listener, _, _) => Some(&**listener),
             #[cfg(unix)]
@@ -438,6 +501,8 @@ const TIME32_PORT: u16 = 37;
 pub enum Time32Socket {
     TcpListener(TcpListener),
     Udp(UdpSocket, HashSet<SocketAddr>),
+    #[cfg(feature="udplite")]
+    UdpLite(UdpLiteSocket, HashSet<SocketAddr>),
     #[cfg(unix)]
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
@@ -483,6 +548,12 @@ impl Time32Socket {
         listen_udp(server, "time32", TIME32_PORT, Ready::readable() | Ready::writable(),
             &mut|socket, Token(_)| ServiceSocket::Time32(Time32Socket::Udp(socket, HashSet::new()))
         );
+        #[cfg(feature="udplite")]
+        listen_udplite(server, "time32", TIME32_PORT, Ready::readable() | Ready::writable(), Some(0),
+            &mut|socket, Token(_)| {
+                ServiceSocket::Time32(Time32Socket::UdpLite(socket, HashSet::new()))
+            }
+        );
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("time32", server, &mut|listener, Token(_)| {
             ServiceSocket::Time32(Time32Socket::UnixStreamListener(listener))
@@ -516,6 +587,10 @@ impl Time32Socket {
             &mut Time32Socket::Udp(ref socket, ref mut outstanding) => {
                 udp_shortsend(socket, server, "time32", readiness, outstanding, &sometime)
             }
+            #[cfg(feature="udplite")]
+            &mut Time32Socket::UdpLite(ref socket, ref mut outstanding) => {
+                udplite_shortsend(socket, server, "time32", readiness, outstanding, &sometime)
+            }
             #[cfg(unix)]
             &mut Time32Socket::UnixDatagram(ref socket, ref mut outstanding) => {
                 unix_datagram_shortsend(socket, "time32", readiness, outstanding, &sometime)
@@ -527,6 +602,8 @@ impl Time32Socket {
         match self {
             &Time32Socket::TcpListener(ref listener) => Some(listener),
             &Time32Socket::Udp(ref socket, _) => Some(socket),
+            #[cfg(feature="udplite")]
+            &Time32Socket::UdpLite(ref socket, _) => Some(socket),
             #[cfg(unix)]
             &Time32Socket::UnixStreamListener(ref listener) => Some(&**listener),
             #[cfg(unix)]
@@ -544,6 +621,8 @@ const DAYTIME_PORT: u16 = 13;
 pub enum DaytimeSocket {
     TcpListener(TcpListener),
     Udp(UdpSocket, HashSet<SocketAddr>),
+    #[cfg(feature="udplite")]
+    UdpLite(UdpLiteSocket, HashSet<SocketAddr>),
     #[cfg(unix)]
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
@@ -598,6 +677,12 @@ impl DaytimeSocket {
                 ServiceSocket::Daytime(DaytimeSocket::Udp(socket, HashSet::new()))
             }
         );
+        #[cfg(feature="udplite")]
+        listen_udplite(server, "daytime", DAYTIME_PORT, Ready::readable() | Ready::writable(), Some(10),
+            &mut|socket, Token(_)| {
+                ServiceSocket::Daytime(DaytimeSocket::UdpLite(socket, HashSet::new()))
+            }
+        );
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("daytime", server, &mut|listener, Token(_)| {
             ServiceSocket::Daytime(DaytimeSocket::UnixStreamListener(listener))
@@ -631,6 +716,10 @@ impl DaytimeSocket {
             &mut DaytimeSocket::Udp(ref socket, ref mut outstanding) => {
                 udp_shortsend(socket, server, "time32", readiness, outstanding, &somewhere)
             }
+            #[cfg(feature="udplite")]
+            &mut DaytimeSocket::UdpLite(ref socket, ref mut outstanding) => {
+                udplite_shortsend(socket, server, "time32", readiness, outstanding, &somewhere)
+            }
             #[cfg(unix)]
             &mut DaytimeSocket::UnixDatagram(ref socket, ref mut outstanding) => {
                 unix_datagram_shortsend(socket, "time32", readiness, outstanding, &somewhere)
@@ -642,6 +731,8 @@ impl DaytimeSocket {
         match self {
             &DaytimeSocket::TcpListener(ref listener) => Some(listener),
             &DaytimeSocket::Udp(ref socket, _) => Some(socket),
+            #[cfg(feature="udplite")]
+            &DaytimeSocket::UdpLite(ref socket, _) => Some(socket),
             #[cfg(unix)]
             &DaytimeSocket::UnixStreamListener(ref listener) => Some(&**listener),
             #[cfg(unix)]

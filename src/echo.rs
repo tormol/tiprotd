@@ -9,6 +9,8 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
 use mio::{IoVec, Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
+#[cfg(feature="udplite")]
+use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
@@ -51,6 +53,8 @@ pub enum EchoSocket {
     TcpListener(TcpListener),
     TcpConn(TcpStreamWrapper, VecDeque<u8>, bool),
     Udp(UdpSocket, VecDeque<(SocketAddr,Rc<[u8]>)>),
+    #[cfg(feature="udplite")]
+    UdpLite(UdpLiteSocket, VecDeque<(SocketAddr,Rc<[u8]>)>),
     #[cfg(unix)]
     UnixStreamListener(UnixSocketWrapper<UnixListener>),
     #[cfg(unix)]
@@ -273,6 +277,10 @@ impl EchoSocket {
         listen_udp(server, "echo", ECHO_PORT, Ready::readable() | Ready::writable(),
             &mut|socket, Token(_)| ServiceSocket::Echo(Udp(socket, VecDeque::new()))
         );
+        #[cfg(feature="udplite")]
+        listen_udplite(server, "echo", ECHO_PORT, Ready::readable() | Ready::writable(), None,
+            &mut|socket, Token(_)| ServiceSocket::Echo(UdpLite(socket, VecDeque::new()))
+        );
         #[cfg(unix)]
         UnixSocketWrapper::create_stream_listener("echo", server,
             &mut|listener, Token(_)| ServiceSocket::Echo(UnixStreamListener(listener))
@@ -323,6 +331,43 @@ impl EchoSocket {
                 }
                 while let Some((addr,msg)) = unsent.front() {
                     if udp_send(socket, msg, addr, "echo") {
+                        let _ = unsent.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if unsent.capacity() > 10  &&  unsent.capacity()/8 > unsent.len() {
+                    unsent.shrink_to_fit();
+                }
+                Drained
+            }
+            #[cfg(feature="udplite")]
+            &mut UdpLite(ref socket, ref mut unsent) => {
+                if readiness.is_readable() {
+                    let result = udplite_receive(socket, server, "echo", |len, from, server| {
+                        if server.limits.allow_unacknowledged_send(from, 2*len) {
+                            eprintln!("{} udplite://{} sends {} bytes to echo",
+                                now(), native_addr(from), len
+                            );
+                            // TODO send directly if unsent.is_empty()
+                            let msg = Rc::<[u8]>::from(&server.buffer[..len]);
+                            unsent.push_back((from, msg.clone()));
+                            unsent.push_back((from, msg));
+                        }
+                    });
+                    if result == Remove {
+                        return Remove;
+                    }
+                }
+                while let Some((addr,msg)) = unsent.front() {
+                    let coverage = (msg.len() / 2) as u16;
+                    if let Err(e) = socket.set_send_checksum_coverage(Some(coverage)) {
+                        eprintln!(
+                            "{} UDP-lite echo cannot set response checksum coverage to {} of {}: {}",
+                            now(), coverage, msg.len(), e
+                        );
+                    }
+                    if udplite_send(socket, msg, addr, "echo") {
                         let _ = unsent.pop_front();
                     } else {
                         break;
@@ -399,6 +444,8 @@ impl EchoSocket {
         match self {
             &TcpListener(ref listener) => Some(listener),
             &Udp(ref socket, _) => Some(socket),
+            #[cfg(feature="udplite")]
+            &UdpLite(ref socket, _) => Some(socket),
             &TcpConn(ref conn, _, _) => Some(&**conn),
             #[cfg(unix)]
             &UnixStreamListener(ref listener) => Some(&**listener),
