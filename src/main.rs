@@ -23,7 +23,7 @@ extern crate mio;
 extern crate udplite;
 #[cfg(unix)]
 extern crate mio_uds;
-#[cfg(feature="seqpacket")]
+#[cfg(unix)]
 extern crate uds;
 #[cfg(feature="posixmq")]
 extern crate posixmq;

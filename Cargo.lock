@@ -296,6 +296,7 @@ checksum = "732d5b238b37066006934fd6635fc759d784f96382944720faa5f305e40db475"
 dependencies = [
  "libc",
  "mio",
+ "mio-uds",
 ]
 
 [[package]]

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
-use std::os::unix::net::SocketAddr as UnixSocketAddr;
+use std::os::unix::net::SocketAddr as StdUnixSocketAddr;
 #[cfg(unix)]
 use std::os::raw::c_int;
 
@@ -19,6 +19,8 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use mio_uds::{UnixListener, UnixStream, UnixDatagram};
+#[cfg(unix)]
+use uds::{UnixSocketAddr, UnixSocketAddrRef, UnixListenerExt, UnixDatagramExt};
 #[cfg(feature="seqpacket")]
 use uds::nonblocking::{UnixSeqpacketListener, UnixSeqpacketConn};
 #[cfg(unix)]
@@ -528,20 +530,23 @@ pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
 /// also for listeners, deletes on drop if named
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct UnixSocketWrapper<S: Descriptor>(pub S, pub Box<str>);
+pub struct UnixSocketWrapper<S: Descriptor>(pub S, pub Box<UnixSocketAddr>);
 #[cfg(unix)]
 impl<S: Descriptor> UnixSocketWrapper<S> {
-    fn create(on: String,  server: &mut Server,  binder: fn(&str)->Result<S,io::Error>)
+    fn create_path(on: String,  server: &mut Server,  binder: fn(&str)->Result<S,io::Error>)
     -> Option<Self> {
         match binder(&on) {
-            Ok(socket) => Some(UnixSocketWrapper(socket, on.into_boxed_str())),
+            Ok(socket) => {
+                let addr = UnixSocketAddr::from_path(&on).unwrap();
+                Some(UnixSocketWrapper(socket, Box::new(addr)))
+            }
             Err(ref e) if e.kind() == ErrorKind::PermissionDenied
             && server.path_base.starts_with("/") => {
                 eprintln!("Doesn't have permission to create unix socket in {}, trying current directory instead",
                     server.path_base
                 );
                 server.path_base = "";
-                Self::create(on, server, binder)
+                Self::create_path(on, server, binder)
             }
             Err(ref e) if e.kind() == ErrorKind::AddrInUse => {
                 // try to connect to see if it's stale, then remove it and try again if it is
@@ -558,7 +563,7 @@ impl<S: Descriptor> UnixSocketWrapper<S> {
                             _ => {
                                 eprintln!("Removed stale socket {:?}", on);
                                 // try again
-                                Self::create(on, server, binder)
+                                Self::create_path(on, server, binder)
                             }
                         }
                     },
@@ -574,19 +579,56 @@ impl<S: Descriptor> UnixSocketWrapper<S> {
             }
         }
     }
+    fn create_abstract
+    (name: &str,  _: &mut Server,  binder: fn(&UnixSocketAddr)->Result<S,io::Error>)
+    -> Option<Self> {
+        if !UnixSocketAddr::has_abstract_addresses() {
+            return None;
+        }
+        let addr = match UnixSocketAddr::from_abstract(name) {
+            Ok(addr) => addr,
+            Err(e) if UnixSocketAddr::has_abstract_addresses() => {
+                eprintln!("Cannot use @{}: {}", name, e);
+                return None;
+            }
+            Err(_) => return None,
+        };
+        match binder(&addr) {
+            Ok(socket) => Some(UnixSocketWrapper(socket, Box::new(addr))),
+            Err(e) => {
+                eprintln!("Cannot listen on @{}: {}", name, e);
+                None
+            }
+        }
+    }
+    fn register(self,  socket_type: &str,
+            poll_for: Ready,  server: &mut Server,
+            encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
+    ) {
+        let entry = server.sockets.vacant_entry();
+        let token = Token(entry.key());
+        match server.poll.register(&self.0, token, poll_for, PollOpt::edge()) {
+            Ok(()) => {entry.insert(encapsulate(self, token));}
+            Err(e) => {panic!("Cannot register unix {}: {}", socket_type, e)}
+        }
+    }
 }
 #[cfg(unix)]
 impl UnixSocketWrapper<UnixListener> {
     pub fn create_stream_listener(service_name: &str,  server: &mut Server,
             encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
-        let on = format!("{}.socket", service_name);
-        if let Some(socket) = Self::create(on, server, |path| UnixListener::bind(path) ) {
-            let entry = server.sockets.vacant_entry();
-            let token = Token(entry.key());
-            server.poll.register(&*socket, token, Ready::readable(), PollOpt::edge())
-                .expect("Cannot register unix stream listener");
-            entry.insert(encapsulate(socket, token));
+        let path_name = format!("{}.socket", service_name);
+        let res = Self::create_path(path_name, server, |path| UnixListener::bind(path) );
+        if let Some(socket) = res {
+            socket.register("stream listener", Ready::readable(), server, encapsulate);
+
+            let res = Self::create_abstract(service_name, server, |addr| {
+                UnixListener::bind_unix_addr(addr)
+            });
+            if let Some(socket) = res {
+                socket.register("stream listener", Ready::readable(), server, encapsulate);
+            }
         }
     }
 }
@@ -595,13 +637,20 @@ impl UnixSocketWrapper<UnixDatagram> {
     pub fn create_datagram_socket(service_name: &str,  poll_for: Ready,
             server: &mut Server,  encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
-        let on = format!("{}_dgram.socket", service_name);
-        if let Some(socket) = Self::create(on, server, |path| UnixDatagram::bind(path) ) {
-            let entry = server.sockets.vacant_entry();
-            let token = Token(entry.key());
-            server.poll.register(&*socket, token, poll_for, PollOpt::edge())
-                .expect("Cannot register unix datagram socket");
-            entry.insert(encapsulate(socket, token));
+        let path_name = format!("{}_dgram.socket", service_name);
+        let res = Self::create_path(path_name, server, |path| UnixDatagram::bind(path) );
+        if let Some(socket) = res {
+            socket.register("datagram socket", poll_for, server, encapsulate);
+
+            let abstract_name = format!("{}_dgram", service_name);
+            let res = Self::create_abstract(&abstract_name, server, |addr| {
+                let socket = UnixDatagram::unbound()?;
+                socket.bind_to_unix_addr(addr)?;
+                Ok(socket)
+            });
+            if let Some(socket) = res {
+                socket.register("datagram socket", poll_for, server, encapsulate);
+            }
         }
     }
 }
@@ -610,16 +659,20 @@ impl UnixSocketWrapper<UnixSeqpacketListener> {
     pub fn create_seqpacket_listener(service_name: &str,  server: &mut Server,
         encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
-        let on = format!("{}_seqpacket.socket", service_name);
-        let res = Self::create(on, server, |path| {
+        let path_name = format!("{}_seqpacket.socket", service_name);
+        let res = Self::create_path(path_name, server, |path| {
             UnixSeqpacketListener::bind(&path)
         });
         if let Some(socket) = res {
-            let entry = server.sockets.vacant_entry();
-            let token = Token(entry.key());
-            server.poll.register(&*socket, token, Ready::readable(), PollOpt::edge())
-                .expect("Cannot register unix seqpacket listener");
-            entry.insert(encapsulate(socket, token));
+            socket.register("seqpacket listener", Ready::readable(), server, encapsulate);
+
+            let abstract_name = format!("{}_seqpacket", service_name);
+            let res = Self::create_abstract(&abstract_name, server, |name| {
+                UnixSeqpacketListener::bind_unix_addr(name)
+            });
+            if let Some(socket) = res {
+                socket.register("seqpacket listener", Ready::readable(), server, encapsulate);
+            }
         }
     }
 }
@@ -633,8 +686,8 @@ impl<S: Descriptor> Deref for UnixSocketWrapper<S> {
 #[cfg(unix)]
 impl<S: Descriptor> Drop for UnixSocketWrapper<S> {
     fn drop(&mut self) {
-        if !self.1.starts_with('\0') {
-            if let Err(err) = std::fs::remove_file(self.1.as_ref()) {
+        if let UnixSocketAddrRef::Path(path) = self.1.as_ref().as_ref() {
+            if let Err(err) = std::fs::remove_file(path) {
                 eprintln!("Couldn't delete {}: {}", self.1, err);
             }
         }
@@ -712,7 +765,7 @@ pub fn unix_stream_accept_loop<
 #[derive(Debug)]
 pub struct UnixStreamWrapper {
     stream: UnixStream,
-    pub addr: UnixSocketAddr,
+    pub addr: StdUnixSocketAddr,
     pub service_name: &'static &'static str,
 }
 #[cfg(unix)]
@@ -937,7 +990,7 @@ pub fn udplite_send(from: &UdpLiteSocket,  msg: &[u8],  to: &SocketAddr,  servic
 
 /// returns false if a WouldBlock error was returned, and logs errors
 #[cfg(unix)]
-pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &UnixSocketAddr,
+pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &StdUnixSocketAddr,
         service_name: &str
 ) -> bool {
     if let Some(path) = to.as_pathname() {

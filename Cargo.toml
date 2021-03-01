@@ -10,19 +10,19 @@ edition = "2018"
 mio = "0.6"
 udplite = {version="0.1", features=["mio_06"], optional=true}
 mio-uds = "0.6.7"
-uds = {version="0.2.2", features=["mio"], optional=true}
 posixmq = {version="1.0", features=["mio_06"], optional=true}
 slab = "0.4"
 chrono = "0.4"
 rand = "0.7"
 
 [target.'cfg(unix)'.dependencies] # maybe not neccessary, but I'm not testing on Windows
+uds = {version="0.2.2", features=["mio", "mio-uds"]}
 nix = "0.14.1"
 
 [features]
 sctp = []
 dccp = []
-seqpacket = ["uds"]
+seqpacket = []
 
 #[target.'cfg(target_os="linux")'.features]
 default = ["sctp", "udplite", "dccp", "seqpacket", "posixmq"]
