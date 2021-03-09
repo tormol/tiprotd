@@ -51,6 +51,7 @@ impl Protocol {
             "posixmq", "pipe",
         ][self as u8 as usize]
     }
+    #[allow(unused)]
     pub fn prefix(self) -> &'static str {
         [
             "",
