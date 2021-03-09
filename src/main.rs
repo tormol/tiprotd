@@ -73,6 +73,7 @@ pub enum ServiceSocket {
     Qotd(shortsend::QotdSocket),
     Time32(shortsend::Time32Socket),
     Daytime(shortsend::DaytimeSocket),
+    Sysstat(shortsend::SysstatSocket),
     CurrentlyMoved
 }
 impl ServiceSocket {
@@ -82,6 +83,7 @@ impl ServiceSocket {
         shortsend::QotdSocket::setup(server);
         shortsend::Time32Socket::setup(server);
         shortsend::DaytimeSocket::setup(server);
+        shortsend::SysstatSocket::setup(server);
         #[cfg(unix)]
         signal::SignalReceiver::setup(server);
     }
@@ -93,6 +95,7 @@ impl ServiceSocket {
             ServiceSocket::Qotd(qotd) => qotd.ready(readiness, this_token, server),
             ServiceSocket::Time32(time32) => time32.ready(readiness, this_token, server),
             ServiceSocket::Daytime(daytime) => daytime.ready(readiness, this_token, server),
+            ServiceSocket::Sysstat(sysstat) => sysstat.ready(readiness, this_token, server),
             #[cfg(unix)]
             ServiceSocket::SignalReceiver(sr) => sr.ready(readiness, this_token, server),
             ServiceSocket::CurrentlyMoved => {
@@ -107,6 +110,7 @@ impl ServiceSocket {
             ServiceSocket::Qotd(qotd) => qotd.inner_descriptor(),
             ServiceSocket::Time32(time32) => time32.inner_descriptor(),
             ServiceSocket::Daytime(daytime) => daytime.inner_descriptor(),
+            ServiceSocket::Sysstat(sysstat) => sysstat.inner_descriptor(),
             #[cfg(unix)]
             ServiceSocket::SignalReceiver(sr) => sr.inner_descriptor(),
             ServiceSocket::CurrentlyMoved => None

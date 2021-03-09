@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::SystemTime;
+use std::mem::size_of;
 
 use mio::{Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
@@ -739,6 +740,70 @@ impl DaytimeSocket {
             &DaytimeSocket::UnixDatagram(ref socket, _) => Some(&**socket),
             #[cfg(feature="seqpacket")]
             &DaytimeSocket::UnixSeqpacketListener(ref listener) => Some(&**listener),
+        }
+    }
+}
+
+#[allow(unused)]
+const SYSSTAT_PORT: u16 = 11;
+
+#[derive(Debug)]
+pub enum SysstatSocket {
+    #[cfg(unix)]
+    UnixStreamListener(UnixSocketWrapper<UnixListener>),
+    #[cfg(unix)]
+    UnixDatagram(UnixSocketWrapper<UnixDatagram>, Vec<UnixSocketAddr>),
+    #[cfg(feature="seqpacket")]
+    UnixSeqpacketListener(UnixSocketWrapper<UnixSeqpacketListener>),
+}
+
+impl SysstatSocket {
+    pub fn setup(server: &mut Server) {
+        #[cfg(unix)]
+        UnixSocketWrapper::create_stream_listener("sysstat", server, &mut|listener, Token(_)| {
+            ServiceSocket::Sysstat(SysstatSocket::UnixStreamListener(listener))
+        });
+        #[cfg(unix)]
+        UnixSocketWrapper::create_datagram_socket("sysstat", Ready::all(), server,
+            &mut|socket, Token(_)| {
+                ServiceSocket::Sysstat(SysstatSocket::UnixDatagram(socket, Vec::new()))
+            }
+        );
+        #[cfg(feature="seqpacket")]
+        UnixSocketWrapper::create_seqpacket_listener("sysstat", server, &mut|listener, Token(_)| {
+            ServiceSocket::Sysstat(SysstatSocket::UnixSeqpacketListener(listener))
+        });
+    }
+
+    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+        let status = format!(
+"sockets: {}
+receive buffer size: {}B
+entry size: {}B
+", server.sockets.len(), server.buffer.len(), size_of::<ServiceSocket>());
+        match self {
+            &mut SysstatSocket::UnixStreamListener(ref listener) => {
+                unix_stream_shortsend_accept_loop(listener, server, &"sysstat", status.as_bytes())
+            }
+            #[cfg(feature="seqpacket")]
+            &mut SysstatSocket::UnixSeqpacketListener(ref listener) => {
+                unix_seqpacket_shortsend_accept_loop(listener, server, &"sysstat", status.as_bytes())
+            }
+            #[cfg(unix)]
+            &mut SysstatSocket::UnixDatagram(ref socket, ref mut outstanding) => {
+                unix_datagram_shortsend(socket, "sysstat", readiness, outstanding, status.as_bytes())
+            }
+        }
+    }
+
+    pub fn inner_descriptor(&self) -> Option<&(dyn Descriptor+'static)> {
+        match self {
+            #[cfg(unix)]
+            &SysstatSocket::UnixStreamListener(ref listener) => Some(&**listener),
+            #[cfg(unix)]
+            &SysstatSocket::UnixDatagram(ref socket, _) => Some(&**socket),
+            #[cfg(feature="seqpacket")]
+            &SysstatSocket::UnixSeqpacketListener(ref listener) => Some(&**listener),
         }
     }
 }
