@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::fmt::Display;
 use std::net::Shutdown;
 use std::io::{self, ErrorKind, Read, Write, stdout};
 #[cfg(unix)]
@@ -14,6 +14,8 @@ use mio::{PollOpt, Poll};
 use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
+#[cfg(unix)]
+use uds::UnixDatagramExt;
 #[cfg(feature="seqpacket")]
 use uds::nonblocking::UnixSeqpacketListener;
 
@@ -156,11 +158,11 @@ pub enum DiscardSocket {
 
 use self::DiscardSocket::*;
 
-fn anti_discard(from: &dyn Debug,  protocol: &str,  bytes: &[u8]) {
+fn anti_discard(from: &dyn Display,  protocol: &str,  bytes: &[u8]) {
     let now = now();
-    eprintln!("{} {}://{:?} discards {} bytes", now, protocol, from, bytes.len());
+    eprintln!("{} {}://{} discards {} bytes", now, protocol, from, bytes.len());
     // TODO rate limit logging to prevent filling up disk
-    print!("{} {}://{:?} discards {} bytes: ", now, protocol, from, bytes.len());
+    print!("{} {}://{} discards {} bytes: ", now, protocol, from, bytes.len());
     // TODO escape to printable characters
     stdout().write(bytes).expect("Writing to stdout failed");
     if bytes.last().cloned() != Some(b'\n') {
@@ -319,7 +321,7 @@ impl DiscardSocket {
             #[cfg(unix)]
             &mut UnixDatagram(ref socket) => {
                 loop {
-                    match socket.recv_from(&mut server.buffer) {
+                    match socket.recv_from_unix_addr(&mut server.buffer) {
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => break Drained,
                         Err(e) => {
                             eprintln!("Error receiving unix datagram packet to discard: {}", e);

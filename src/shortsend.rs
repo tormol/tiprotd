@@ -5,13 +5,13 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::SystemTime;
-#[cfg(unix)]
-use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
 use mio::{Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(feature="udplite")]
 use udplite::UdpLiteSocket;
+#[cfg(unix)]
+use uds::{UnixSocketAddr, UnixDatagramExt};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
@@ -228,12 +228,12 @@ fn unix_datagram_shortsend(
 ) -> EntryStatus {
     if readiness.is_readable() {
         loop {
-            match socket.recv_from(&mut [0; 32]) {
+            match socket.recv_from_unix_addr(&mut [0; 32]) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                 // send errors might be returned on the next read
                 Err(e) => eprintln!("unix datagram {} error (on receive): {}", service_name, e),
                 Ok((len, from)) => {
-                    eprintln!("{} uddg://{:?} sends {} bytes for {}",
+                    eprintln!("{} uddg://{} sends {} bytes for {}",
                         now(), from, len, service_name
                     );
                     // little copying involved, so don't bother sending directly

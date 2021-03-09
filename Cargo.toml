@@ -16,7 +16,7 @@ chrono = "0.4"
 rand = "0.7"
 
 [target.'cfg(unix)'.dependencies] # maybe not neccessary, but I'm not testing on Windows
-uds = {version="0.2.2", features=["mio", "mio-uds"]}
+uds = {version="0.2.3", features=["mio", "mio-uds"]}
 nix = "0.14.1"
 
 [features]

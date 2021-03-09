@@ -4,13 +4,13 @@ use std::net::{Shutdown, SocketAddr};
 use std::rc::Rc;
 #[cfg(feature="seqpacket")]
 use std::io::IoSlice;
-#[cfg(unix)]
-use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
 use mio::{IoVec, Ready, Token};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(feature="udplite")]
 use udplite::UdpLiteSocket;
+#[cfg(unix)]
+use uds::{UnixSocketAddr, UnixDatagramExt};
 #[cfg(unix)]
 use mio_uds::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
@@ -382,12 +382,12 @@ impl EchoSocket {
             &mut UnixDatagram(ref socket, ref mut unsent) => {
                 if readiness.is_readable() {
                     loop {
-                        match socket.recv_from(&mut server.buffer) {
+                        match socket.recv_from_unix_addr(&mut server.buffer) {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                             // send errors might be returned on the next read
                             Err(e) => eprintln!("unix datagram echo error (on receive): {}", e),
                             Ok((len, from)) => {
-                                eprintln!("{} uddg://{:?} sends {} bytes to echo",
+                                eprintln!("{} uddg://{} sends {} bytes to echo",
                                     now(), from, len
                                 );
                                 // TODO send directly if unsent.is_empty()

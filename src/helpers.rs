@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
-use std::os::unix::net::SocketAddr as StdUnixSocketAddr;
-#[cfg(unix)]
 use std::os::raw::c_int;
 
 use chrono::Local;
@@ -644,9 +642,7 @@ impl UnixSocketWrapper<UnixDatagram> {
 
             let abstract_name = format!("{}_dgram", service_name);
             let res = Self::create_abstract(&abstract_name, server, |addr| {
-                let socket = UnixDatagram::unbound()?;
-                socket.bind_to_unix_addr(addr)?;
-                Ok(socket)
+                UnixDatagram::bind_unix_addr(addr)
             });
             if let Some(socket) = res {
                 socket.register("datagram socket", poll_for, server, encapsulate);
@@ -725,9 +721,8 @@ pub fn unix_stream_accept_loop<
         mut trier: T,  mut wrapper: W
 ) -> EntryStatus {
     loop {
-        match listener.accept() {
+        match listener.accept_unix_addr() {
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Drained,
-            Ok(None) => return Drained,
             Err(ref e) if e.kind() == ErrorKind::ConnectionAborted => continue,
             Err(ref e) if e.kind() == ErrorKind::ConnectionRefused => continue,
             Err(ref e) if e.kind() == ErrorKind::ConnectionReset => continue,
@@ -737,8 +732,8 @@ pub fn unix_stream_accept_loop<
                 // this allows EMFILE or ENFILE DoS attack, but unix sockets aren't important
                 return Remove;
             }
-            Ok(Some((stream, addr))) => {
-                let mut stream = UnixStreamWrapper{stream, addr, service_name};
+            Ok((stream, addr)) => {
+                let mut stream = UnixStreamWrapper{stream, addr: Box::new(addr), service_name};
                 eprintln!("{} {} uds://{:?} connection established",
                     now(), service_name, stream.addr
                 );
@@ -765,7 +760,7 @@ pub fn unix_stream_accept_loop<
 #[derive(Debug)]
 pub struct UnixStreamWrapper {
     stream: UnixStream,
-    pub addr: StdUnixSocketAddr,
+    pub addr: Box::<UnixSocketAddr>,
     pub service_name: &'static &'static str,
 }
 #[cfg(unix)]
@@ -990,15 +985,11 @@ pub fn udplite_send(from: &UdpLiteSocket,  msg: &[u8],  to: &SocketAddr,  servic
 
 /// returns false if a WouldBlock error was returned, and logs errors
 #[cfg(unix)]
-pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &StdUnixSocketAddr,
+pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &UnixSocketAddr,
         service_name: &str
 ) -> bool {
-    if let Some(path) = to.as_pathname() {
-        if !path.starts_with("/") {
-            eprintln!("Won't send to relative socket address {:?}", path);
-            return true;
-        }
-        match from.send_to(msg, path) {
+    if to.is_absolute_path() || to.is_abstract() {
+        match from.send_to_unix_addr(msg, to) {
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => return false,
             Err(e) => {
                 eprintln!("error sending unix datagram packet ({}, uddg://{:?}): {}",
@@ -1013,8 +1004,11 @@ pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &StdUnixSocketA
             Ok(_) => {}
         }
         true
-    } else {
-        eprintln!("std doesn't allow sending unix datagram to {:?}, sorry", to);
+    } else if to.is_relative_path() {
+        eprintln!("Refusing to send unix datagram to relative path {:?} (it could be our own address)", to);
+        true
+    } else /*unnamed*/ {
+        eprintln!("Pointless to send unix datagram into the void");
         true
     }
 }
