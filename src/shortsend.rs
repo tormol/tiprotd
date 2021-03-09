@@ -703,26 +703,26 @@ impl DaytimeSocket {
         let somewhere = new_daytime().into_bytes();
         match self {
             &mut DaytimeSocket::TcpListener(ref listener) => {
-                tcp_shortsend_accept_loop(listener, server, &"time32", &somewhere)
+                tcp_shortsend_accept_loop(listener, server, &"daytime", &somewhere)
             }
             #[cfg(unix)]
             &mut DaytimeSocket::UnixStreamListener(ref listener) => {
-                unix_stream_shortsend_accept_loop(listener, server, &"time32", &somewhere)
+                unix_stream_shortsend_accept_loop(listener, server, &"daytime", &somewhere)
             }
             #[cfg(feature="seqpacket")]
             &mut DaytimeSocket::UnixSeqpacketListener(ref listener) => {
-                unix_seqpacket_shortsend_accept_loop(listener, server, &"time32", &somewhere)
+                unix_seqpacket_shortsend_accept_loop(listener, server, &"daytime", &somewhere)
             }
             &mut DaytimeSocket::Udp(ref socket, ref mut outstanding) => {
-                udp_shortsend(socket, server, "time32", readiness, outstanding, &somewhere)
+                udp_shortsend(socket, server, "daytime", readiness, outstanding, &somewhere)
             }
             #[cfg(feature="udplite")]
             &mut DaytimeSocket::UdpLite(ref socket, ref mut outstanding) => {
-                udplite_shortsend(socket, server, "time32", readiness, outstanding, &somewhere)
+                udplite_shortsend(socket, server, "daytime", readiness, outstanding, &somewhere)
             }
             #[cfg(unix)]
             &mut DaytimeSocket::UnixDatagram(ref socket, ref mut outstanding) => {
-                unix_datagram_shortsend(socket, "time32", readiness, outstanding, &somewhere)
+                unix_datagram_shortsend(socket, "daytime", readiness, outstanding, &somewhere)
             }
         }
     }
