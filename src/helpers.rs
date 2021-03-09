@@ -682,7 +682,7 @@ impl<S: Descriptor> Deref for UnixSocketWrapper<S> {
 #[cfg(unix)]
 impl<S: Descriptor> Drop for UnixSocketWrapper<S> {
     fn drop(&mut self) {
-        if let UnixSocketAddrRef::Path(path) = self.1.as_ref().as_ref() {
+        if let Some(path) = self.1.as_pathname() {
             if let Err(err) = std::fs::remove_file(path) {
                 eprintln!("Couldn't delete {}: {}", self.1, err);
             }
@@ -830,7 +830,7 @@ pub fn unix_seqpacket_accept_loop<
                 return Remove;
             }
             Ok((conn, addr)) => {
-                let mut conn = UnixSeqpacketConnWrapper{conn, addr, service_name};
+                let mut conn = UnixSeqpacketConnWrapper{conn, addr: Box::new(addr), service_name};
                 eprintln!("{} {} udsq://{} connection established",
                     now(), service_name, conn.addr
                 );
@@ -858,7 +858,7 @@ pub fn unix_seqpacket_accept_loop<
 #[derive(Debug)]
 pub struct UnixSeqpacketConnWrapper {
     conn: UnixSeqpacketConn,
-    pub addr: uds::UnixSocketAddr,
+    pub addr: Box<UnixSocketAddr>,
     pub service_name: &'static &'static str,
 }
 #[cfg(feature="seqpacket")]
