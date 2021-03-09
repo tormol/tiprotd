@@ -1,5 +1,5 @@
 /* tiprotd - A toy server implementing trivial network protocols with a twist
- * Copyright (C) 2019  Torbjørn Birch Moltu
+ * Copyright (C) 2019, 2021 Torbjørn Birch Moltu
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by

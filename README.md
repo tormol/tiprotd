@@ -49,7 +49,7 @@ get familiar with the transport layer protocols and sockets programming in gener
 
 ## License
 
-Copyright 2019 Torbjørn Birch Moltu
+Copyright 2019, 2021 Torbjørn Birch Moltu
 
 This program can be redistributed and/or modified under the terms of the
 GNU Affero General Public License as published by the Free Software Foundation,
