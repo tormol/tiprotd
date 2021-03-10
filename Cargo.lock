@@ -249,6 +249,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sctp"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c14e12d6f8af50d9d152fe107da68d55f48dabccb58e77b7deca7e04f34c5230"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -270,11 +279,13 @@ name = "tiprotd"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "libc",
  "mio",
  "mio-uds",
  "nix",
  "posixmq",
  "rand",
+ "sctp",
  "slab",
  "udplite",
  "uds",

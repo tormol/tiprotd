@@ -19,6 +19,8 @@ extern crate chrono;
 extern crate rand;
 extern crate slab;
 extern crate mio;
+#[cfg(feature="sctp")]
+extern crate sctp as sctp_crate;
 #[cfg(feature="udplite")]
 extern crate udplite;
 #[cfg(unix)]
@@ -29,10 +31,14 @@ extern crate uds;
 extern crate posixmq;
 #[cfg(unix)]
 extern crate nix;
+#[cfg(unix)]
+extern crate libc;
 
 mod assigned_addr;
 mod client_limiter;
 use client_limiter::ClientLimiter;
+#[cfg(feature="sctp")]
+mod sctp;
 mod helpers;
 use helpers::*;
 mod discard;

@@ -22,6 +22,8 @@ use uds::nonblocking::UnixSeqpacketListener;
 use crate::Server;
 use crate::ServiceSocket;
 use crate::helpers::*;
+#[cfg(feature="sctp")]
+use crate::sctp::SctpSocket;
 
 const DISCARD_PORT: u16 = 9;
 
@@ -137,6 +139,8 @@ pub enum DiscardSocket {
     // but need to release resources
     TcpListener(TcpListener),
     TcpConn(TcpStreamWrapper),
+    #[cfg(feature="sctp")]
+    Sctp(SctpSocket),
     Udp(UdpSocket),
     #[cfg(feature="udplite")]
     UdpLite(UdpLiteSocket),
@@ -177,6 +181,10 @@ impl DiscardSocket {
         );
         listen_udp(server, "discard", DISCARD_PORT, Ready::readable(),
             &mut|socket, Token(_)| ServiceSocket::Discard(Udp(socket))
+        );
+        #[cfg(feature="sctp")]
+        listen_sctp(server, "discard", DISCARD_PORT,
+            &mut|socket, Token(_)| ServiceSocket::Discard(Sctp(socket))
         );
         #[cfg(feature="udplite")]
         listen_udplite(server, "discard", DISCARD_PORT, Ready::readable(), None,
@@ -223,6 +231,34 @@ impl DiscardSocket {
                         }
                         end => {
                             stream.end(end, "reading bytes to discard");
+                            break Remove;
+                        }
+                    }
+                }
+            }
+            &mut Sctp(ref socket) => {
+                loop {
+                    match socket.revc_from(&mut server.buffer) {
+                        Err(ref e) if e.kind() == ErrorKind::WouldBlock => break Drained,
+                        Ok((len, stream, from, notification)) => {
+                            let from = match &from {
+                                &Some(ref addr) => addr as &dyn Display,
+                                &None => &"<no address>",
+                            };
+                            if let Some(notification) = notification {
+                                eprintln!(
+                                    "{} sctp notification {:?} from {} (stream {}, received {} bytes)",
+                                    now(), notification, from, stream, len
+                                );
+                            }
+                            anti_discard(
+                                &format_args!("{} on stream {}", &from, &stream),
+                                "sctp",
+                                &server.buffer[..len],
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("{} Error receive bytes to discard: {}", now(), e);
                             break Remove;
                         }
                     }
@@ -376,6 +412,8 @@ impl DiscardSocket {
         match self {
             &TcpListener(ref listener) => Some(listener),
             &Udp(ref socket) => Some(socket),
+            #[cfg(feature="sctp")]
+            &Sctp(ref socket) => Some(socket),
             #[cfg(feature="udplite")]
             &UdpLite(ref socket) => Some(socket),
             &TcpConn(ref conn) => Some(&**conn),

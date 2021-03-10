@@ -13,12 +13,12 @@ use std::os::raw::c_int;
 use chrono::Local;
 use mio::{Evented, PollOpt, Ready, Token};
 use mio::net::{TcpListener, TcpStream, UdpSocket};
-#[cfg(any(target_os="linux", target_os="android", target_os="freebsd"))]
+#[cfg(feature="udplite")]
 use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use mio_uds::{UnixListener, UnixStream, UnixDatagram};
 #[cfg(unix)]
-use uds::{UnixSocketAddr, UnixSocketAddrRef, UnixListenerExt, UnixDatagramExt};
+use uds::{UnixSocketAddr, UnixListenerExt, UnixDatagramExt};
 #[cfg(feature="seqpacket")]
 use uds::nonblocking::{UnixSeqpacketListener, UnixSeqpacketConn};
 #[cfg(unix)]
@@ -31,6 +31,8 @@ use nix::libc;
 use crate::client_limiter::ClientStats;
 use crate::ServiceSocket;
 use crate::Server;
+#[cfg(feature="sctp")]
+use crate::sctp::SctpSocket;
 
 
 #[derive(Clone,Copy, PartialEq,Eq,Hash, Debug)]
@@ -252,8 +254,6 @@ pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
         std::process::exit(1);
     }
 
-    #[cfg(feature="sctp")]
-    listen_sctp(server, service_name, port, encapsulate);
     #[cfg(feature="dccp")]
     listen_dccp(server, service_name, port, encapsulate);
 }
@@ -436,19 +436,10 @@ impl Debug for TcpStreamWrapper {
 
 #[cfg(feature="sctp")]
 pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
-        encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
+        encapsulate: &mut dyn FnMut(SctpSocket, Token)->ServiceSocket
 ) {
     let res = server.try_bind_ip("sctp", service_name, port, Ready::readable(),
-        |addr| {
-            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
-            let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
-            let listener = create_incoming_socket(Protocol::Sctp,
-                    libc::SOCK_STREAM, libc::IPPROTO_SCTP,
-                    sockaddr, socklen,
-                    Some(0), false, Some(10/*FIXME*/),
-            )?;
-            unsafe { Ok(TcpListener::from_raw_fd(listener)) }
-        }
+        |addr| SctpSocket::bind(addr)
     );
     if let Some((listener, entry)) = res {
         let token = Token(entry.key()); // make borrowck happy

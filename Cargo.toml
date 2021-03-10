@@ -8,6 +8,7 @@ edition = "2018"
 
 [dependencies]
 mio = "0.6"
+sctp = {version="0.1", optional=true}
 udplite = {version="0.1", features=["mio_06"], optional=true}
 mio-uds = "0.6.7"
 posixmq = {version="1.0", features=["mio_06"], optional=true}
@@ -18,9 +19,9 @@ rand = "0.7"
 [target.'cfg(unix)'.dependencies] # maybe not neccessary, but I'm not testing on Windows
 uds = {version="0.2.3", features=["mio", "mio-uds"]}
 nix = "0.14.1"
+libc = "0.2.71"
 
 [features]
-sctp = []
 dccp = []
 seqpacket = []
 
