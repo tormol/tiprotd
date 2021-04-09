@@ -438,6 +438,9 @@ impl Debug for TcpStreamWrapper {
 pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
         encapsulate: &mut dyn FnMut(SctpSocket, Token)->ServiceSocket
 ) {
+    if server.failed_protocols.contains(&Protocol::Sctp) {
+        return;
+    }
     let res = server.try_bind_ip("sctp", service_name, port, Ready::readable(),
         |addr| SctpSocket::bind(addr)
     );
@@ -445,7 +448,8 @@ pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
         let token = Token(entry.key()); // make borrowck happy
         entry.insert(encapsulate(listener, token));
     } else {
-        std::process::exit(1);
+        eprintln!("Not starting sctp protocol variants");
+        server.failed_protocols.push(Protocol::Sctp);
     }
 }
 
@@ -453,6 +457,9 @@ pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
 pub fn listen_dccp(server: &mut Server,  service_name: &'static str,  port: u16,
         encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
 ) {
+    if server.failed_protocols.contains(&Protocol::Dccp) {
+        return;
+    }
     let res = server.try_bind_ip("dccp", service_name, port, Ready::readable(),
         |addr| {
             let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
@@ -468,7 +475,8 @@ pub fn listen_dccp(server: &mut Server,  service_name: &'static str,  port: u16,
         let token = Token(entry.key()); // make borrowck happy
         entry.insert(encapsulate(listener, token));
     } else {
-        std::process::exit(1);
+        eprintln!("Not starting dccp protocol variants");
+        server.failed_protocols.push(Protocol::Dccp);
     }
 }
 
@@ -493,6 +501,9 @@ pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
         port: u16,  poll_for: Ready,  send_cscov: Option<u16>,
         encapsulate: &mut dyn FnMut(UdpLiteSocket, Token)->ServiceSocket
 ) {
+    if server.failed_protocols.contains(&Protocol::Udplite) {
+        return;
+    }
     let result = server.try_bind_ip("udplite", service_name, port, poll_for,
         |addr| UdpLiteSocket::bind_nonblocking(&addr)
     );
@@ -513,6 +524,9 @@ pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
         }
         let token = Token(entry.key());
         entry.insert(encapsulate(socket, token));
+    } else {
+        eprintln!("Not starting udplite protocol variants");
+        server.failed_protocols.push(Protocol::Udplite);
     }
 }
 
@@ -647,6 +661,9 @@ impl UnixSocketWrapper<UnixSeqpacketListener> {
     pub fn create_seqpacket_listener(service_name: &str,  server: &mut Server,
         encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
+        if server.failed_protocols.contains(&Protocol::Udsq) {
+            return;
+        }
         let path_name = format!("{}_seqpacket.socket", service_name);
         let res = Self::create_path(path_name, server, |path| {
             UnixSeqpacketListener::bind(&path)
@@ -661,6 +678,9 @@ impl UnixSocketWrapper<UnixSeqpacketListener> {
             if let Some(socket) = res {
                 socket.register("seqpacket listener", Ready::readable(), server, encapsulate);
             }
+        } else {
+            eprintln!("Not starting seqpacket protocol variants");
+            server.failed_protocols.push(Protocol::Udsq);
         }
     }
 }

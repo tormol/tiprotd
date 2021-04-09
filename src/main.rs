@@ -133,6 +133,7 @@ pub struct Server {
     port_offset: Option<u16>,
     #[cfg(unix)]
     path_base: &'static str,
+    failed_protocols: Vec<Protocol>, // few elements, limited number of lookups
 }
 impl Server {
     fn new() -> Self {
@@ -145,6 +146,7 @@ impl Server {
             port_offset: None,
             #[cfg(unix)]
             path_base: "/var/run/",
+            failed_protocols: Vec::new(),
         }
     }
 
