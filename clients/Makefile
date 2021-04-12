@@ -1,10 +1,13 @@
 CC?=gcc
-CFLAGS=-Wall -Wextra -Wpedantic -std=c11 -g
+CFLAGS?=-Wall -Wextra -Wpedantic -std=c11 -g
+RUSTFLAGS?=--edition=2018 -C debuginfo=2
 
 all: tcp udp sctp1 udplite dccp unix_stream unix_dgram unix_seqpacket mq time32
 
 clean:
 	rm -f tcp udp sctp1 sctp udplite dccp unix_stream unix_dgram unix_seqpacket mq time32
+
+.PHONY: clean all
 
 tcp: tcp.c
 	$(CC) -o tcp tcp.c $(CFLAGS)
@@ -34,4 +37,4 @@ mq: mq.c
 	$(CC) -o mq mq.c -lrt $(CFLAGS)
 
 time32: time32.rs
-	rustc -o time32 time32.rs
+	rustc -o time32 time32.rs $(RUSTFLAGS)
