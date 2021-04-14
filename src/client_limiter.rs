@@ -22,7 +22,8 @@ pub struct ClientStats {
     whitelisted: bool,
 
     /// from server to client.
-    /// inverted so that we don't need to know the limit for checking
+    /// Inverted so that we don't need to know the limit for checking.
+    /// Set to the max value (!0) when a handshake is completed.
     available_unacknowledged_sent: Cell<u32>,
 
     /// resaources currently held associated with this client.
@@ -52,6 +53,10 @@ impl ClientStats {
             eprintln!("LIMIT EXCEEDED: unacknowledged (UDP) send to {}", self.assigned_addr);
             false
         }
+    }
+
+    pub fn confirm_handshake_completed(&self) {
+        self.available_unacknowledged_sent.set(!0);
     }
 
     pub fn request_resources(&self,  add: usize) -> bool {
@@ -174,6 +179,12 @@ impl ClientLimiter {
             Ok(stats) => stats.allow_unacknowledged_send(to_send),
             Err(true) => true,
             Err(false) => false,
+        }
+    }
+
+    pub fn confirm_handshake_completed(&mut self,  addr: SocketAddr) {
+        if let Ok(stats) = self.register(addr) {
+            stats.confirm_handshake_completed()
         }
     }
 

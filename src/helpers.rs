@@ -349,6 +349,7 @@ pub fn tcp_accept_loop<
                         continue;
                     }
                 };
+                res.confirm_handshake_completed();
                 let mut stream = TcpStreamWrapper {
                     stream,
                     limit_counters: res,
