@@ -7,23 +7,46 @@ use std::mem;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// The phase a client has reached in terms of being blocked from some resource.
+///
+/// Unlimited means the client is whitelisted or has done something to disable the limit.
+/// New means the client hasn't been seen before or that this was the first operation (and it was permitted).
+/// Allowed means the limit is partially used.
+/// ReachedLimit means the client is at the limit - it's not blocked yet but any further usage will be.
+/// CrossedLimit means one operation has been blocked or that the current operation is the first blocked.
+/// AlreadyEexceeded means the client is blocked.
+#[derive(Clone,Copy, Debug, PartialEq,Eq)]
+#[repr(u16)]
+pub enum ClientState { Unlimited, New, Allowed, ReachedLimit, CrossedLimit, AlreadyExceeded }
+use ClientState::*;
+
+impl ClientState {
+    pub fn allowed(self) -> bool {
+        match self {
+            Unlimited | New | Allowed | ReachedLimit => true,
+            CrossedLimit | AlreadyExceeded => false,
+        }
+    }
+}
+
+/// Additional wiggle room in which ReachedLimit is returned instead of ExceededLimit
+const LAST_ALLOWWED_MARGIN: u32 = 100;
 /// Is added to the size of each sent packet to ensure that empty packets are
 /// counted. This should at minimum be the header size for ethernet + IPv6 + UDP,
 /// but can be greater to try to account for the resources required to handle
 /// the packet.
 const UDP_PACKET_COST: u32 = 200; // guesstimate
 
-
 #[derive(Clone, Debug)]
 pub struct ClientStats {
     /// for use in log messages
     assigned_addr: AssignedAddr,
-    /// only checked when limits are reached
     whitelisted: bool,
 
+    /// the state of the unacknowledged send limit.
+    completed_handshake: Cell<ClientState>,
     /// from server to client.
     /// Inverted so that we don't need to know the limit for checking.
-    /// Set to the max value (!0) when a handshake is completed.
     available_unacknowledged_sent: Cell<u32>,
 
     /// resaources currently held associated with this client.
@@ -35,28 +58,54 @@ pub struct ClientStats {
 }
 impl ClientStats {
     // private because ClientLimiter has the expiry time
-    fn allow_unacknowledged_send(&self,  to_send: usize) -> bool {
-        // store smaller type, but perform calculation on usize just in case we
-        // ever receive multi-gigabyte packets
-        let packet_cost = to_send + UDP_PACKET_COST as usize;
-        let before = self.available_unacknowledged_sent.get() as usize;
-        if let Some(afterwards) = before.checked_sub(packet_cost) {
-            self.available_unacknowledged_sent.set(afterwards as u32);
-            true
-        } else if before == 0 {
-            // limit previously reached - don't log
-            false
-        } else {
-            // limit reached - don't send packet. Also don't send future
-            // smaller packets, as that could be surprising
-            self.available_unacknowledged_sent.set(0);
-            eprintln!("LIMIT EXCEEDED: unacknowledged (UDP) send to {}", self.assigned_addr);
-            false
+    fn allow_unacknowledged_send(&self,  to_send: usize) -> ClientState {
+        match self.completed_handshake.get() {
+            Unlimited => Unlimited,
+            AlreadyExceeded => AlreadyExceeded,
+            CrossedLimit => {
+                self.completed_handshake.set(AlreadyExceeded);
+                AlreadyExceeded
+            }
+            ReachedLimit => {
+                self.completed_handshake.set(CrossedLimit);
+                eprintln!("LIMIT EXCEEDED: unacknowledged (UDP) send to {}", self.assigned_addr);
+                CrossedLimit
+            }
+            was @ New | was @ Allowed => {
+                // store smaller type, but perform calculation on usize just in case we
+                // ever receive multi-gigabyte packets
+                let packet_cost = to_send + UDP_PACKET_COST as usize;
+                let before = self.available_unacknowledged_sent.get() as usize;
+                if packet_cost > before + LAST_ALLOWWED_MARGIN as usize {
+                    // limit reached - don't send packet. Also don't send future
+                    // smaller packets, as that could be surprising
+                    self.available_unacknowledged_sent.set(0);
+                    self.completed_handshake.set(CrossedLimit);
+                    eprintln!("LIMIT EXCEEDED: unacknowledged (UDP) send to {}", self.assigned_addr);
+                    CrossedLimit
+                } else {
+                    let afterwards = before.saturating_sub(packet_cost) as u32;
+                    self.available_unacknowledged_sent.set(afterwards);
+                    if afterwards < LAST_ALLOWWED_MARGIN {
+                        self.completed_handshake.set(ReachedLimit);
+                        ReachedLimit
+                    } else if was == New {
+                        self.completed_handshake.set(Allowed);
+                        New
+                    } else {
+                        Allowed
+                    }
+                }
+            }
         }
     }
 
+    pub fn get_unacknowledged_send_state(&self) -> ClientState {
+        self.completed_handshake.get()
+    }
+
     pub fn confirm_handshake_completed(&self) {
-        self.available_unacknowledged_sent.set(!0);
+        self.completed_handshake.set(Unlimited);
     }
 
     pub fn request_resources(&self,  add: usize) -> bool {
@@ -129,6 +178,7 @@ impl ClientLimiter {
                 exceeded_resource_limits: Cell::new(true),
                 available_resources: Cell::new(0), // could be any value
                 available_unacknowledged_sent: Cell::new(!0),
+                completed_handshake: Cell::new(Unlimited),
             }),
         }
     }
@@ -140,17 +190,24 @@ impl ClientLimiter {
             available_unacknowledged_sent: Cell::new(self.unacknowledged_send_limit),
             exceeded_resource_limits: Cell::new(false),
             available_resources: Cell::new(self.resources_limit),
+            completed_handshake: Cell::new(New),
+        }
+    }
+
+    fn categorize_addr(addr: SocketAddr) -> Result<AssignedAddr, bool> {
+        let assigned = AssignedAddr::from(addr);
+        // multicast might require different limits, so block it unconditionally.
+        if assigned.is_multicast() {
+            Err(false)
+        } else {
+            Ok(assigned)
         }
     }
 
     /// handles whitelisting aand blacklisting of addresses, and
     /// removal of expired data
     fn register(&mut self,  addr: SocketAddr) -> Result<&Rc<ClientStats>, bool> {
-        let assigned = AssignedAddr::from(addr);
-        // multicast might require different limits, so block it unconditionally.
-        if assigned.is_multicast() {
-            return Err(false);
-        }
+        let assigned = Self::categorize_addr(addr)?;
         // clear old entries
         let now = Instant::now();
         if now > self.window_end {
@@ -176,15 +233,27 @@ impl ClientLimiter {
 
     pub fn allow_unacknowledged_send(&mut self,  addr: SocketAddr,  to_send: usize) -> bool {
         match self.register(addr) {
-            Ok(stats) => stats.allow_unacknowledged_send(to_send),
+            Ok(stats) => stats.allow_unacknowledged_send(to_send).allowed(),
             Err(true) => true,
             Err(false) => false,
         }
     }
 
+    #[allow(unused)]
     pub fn confirm_handshake_completed(&mut self,  addr: SocketAddr) {
         if let Ok(stats) = self.register(addr) {
             stats.confirm_handshake_completed()
+        }
+    }
+
+    pub fn get_unacknowledged_send_state(&self,  addr: SocketAddr) -> ClientState {
+        match Self::categorize_addr(addr) {
+            Ok(assigned) => match self.stats.get(&assigned) {
+                Some(stats) => stats.get_unacknowledged_send_state(),
+                None => New,
+            },
+            Err(true) => Unlimited,
+            Err(false) => AlreadyExceeded,
         }
     }
 
