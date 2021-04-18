@@ -409,7 +409,7 @@ impl EchoSocket {
                                 );
                                 // TODO send directly if unsent.is_empty()
                                 let msg = Rc::<[u8]>::from(&server.buffer[..len]);
-                                unsent.push_back((from.clone(), msg.clone()));
+                                unsent.push_back((from, msg.clone()));
                                 unsent.push_back((from, msg));
                             }
                         }

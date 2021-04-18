@@ -15,6 +15,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#![allow(
+    clippy::match_ref_pats, // keep it explicit
+    clippy::redundant_closure, // make it clear a function is passed
+    clippy::len_zero, clippy::comparison_to_empty, // ! is easy to miss
+    clippy::single_char_pattern, // converting the character from UTF-32 isn't free either
+)]
+
 extern crate chrono;
 extern crate rand;
 extern crate slab;
@@ -165,9 +172,13 @@ impl Server {
         match binder(on) {
             Ok(mut socket) => {
                 let entry = self.sockets.vacant_entry();
-                self.poll.registry().register(&mut socket, Token(entry.key()), interest)
-                    .expect(&format!("Cannot register {} listener", protocol_name));
-                Some((socket, entry))
+                match self.poll.registry().register(&mut socket, Token(entry.key()), interest) {
+                    Ok(()) => Some((socket, entry)),
+                    Err(e) => {
+                        eprintln!("Cannot register {} listener with mio: {}", protocol_name, e);
+                        None
+                    }
+                }
             }
             Err(ref e) if e.kind() == ErrorKind::PermissionDenied && self.port_offset == None => {
                 eprintln!("Doesn't have permission to listen on reserved ports, falling back to 10_000+port");

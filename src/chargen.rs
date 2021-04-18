@@ -79,7 +79,7 @@ impl CharGenContent {
         let paragraph_start = if paragraph_index == 0 {
             0
         } else {
-            self.paragraphs_end[paragraph_index as usize-1 as usize] as usize
+            self.paragraphs_end[paragraph_index as usize-1] as usize
         };
         &self.text[paragraph_start..paragraph_end]
     }

@@ -133,7 +133,7 @@ fn anti_discard(from: &dyn Display,  protocol: &str,  bytes: &[u8]) {
     // TODO rate limit logging to prevent filling up disk
     print!("{} {}://{} discards {} bytes: ", now, protocol, from, bytes.len());
     // TODO escape to printable characters
-    stdout().write(bytes).expect("Writing to stdout failed");
+    stdout().write_all(bytes).expect("Writing to stdout failed");
     if bytes.last().cloned() != Some(b'\n') {
         println!();
     }
@@ -352,9 +352,9 @@ impl DiscardSocket {
                             break Remove;
                         }
                         Ok(n) => anti_discard(
-                                &mut format_args!("somebody via {}", pipe.path),
-                                "pipe",
-                                &server.buffer[..n]
+                            &format_args!("somebody via {}", pipe.path),
+                            "pipe",
+                            &server.buffer[..n]
                         )
                     }
                 }
