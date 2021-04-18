@@ -220,7 +220,11 @@ fn main() {
 
     let mut events = Events::with_capacity(1024);
     while server.sockets.len() > server.internally_shutdown as usize {
-        server.poll.poll(&mut events, None).expect("Cannot poll selector");
+        if let Err(e) = server.poll.poll(&mut events, None) {
+            if e.kind() != ErrorKind::Interrupted {
+                panic!("Cannot poll selector: {}", e);
+            }
+        }
         //println!("connections: {}, events: {}", server.sockets.len(), events.iter().count());
         for event in events.iter() {
             let entry = match server.sockets.get_mut(event.token().0) {

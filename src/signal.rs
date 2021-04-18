@@ -57,6 +57,16 @@ impl SignalReceiver {
             eprintln!("Cannot ignore SIGTTOU: {}", e);
         }
 
+        // SIGPIPE is ignored by rust programs, but ignore it here for completeness.
+        // Ideally protocols would use MSG_NOSIGNAL when sending,
+        // and the signal would be used by stdout and stderr to shut down cleanly.
+        // mio doesn't do that though, and if we write anything during shutdown the signal would
+        // have been triggered again.
+        // (Which would have killed the program as it was using SA_RESETHAND).
+        if let Err(e) = unsafe { signal::signal(signal::SIGPIPE, signal::SigHandler::SigIgn) } {
+            eprintln!("Cennot ignore SIGPIPE: {}", e);
+        }
+
         let (writer, mut reader) = match pipe::new() {
             Ok(pair) => pair,
             Err(e) => {
@@ -95,9 +105,6 @@ impl SignalReceiver {
         }
         if let Err(e) = unsafe { signal::sigaction(signal::SIGTERM, &shutdown_action) } {
             eprintln!("Cannot set SIGTERM handler: {}", e);
-        }
-        if let Err(e) = unsafe { signal::sigaction(signal::SIGPIPE, &shutdown_action) } {
-            eprintln!("Cennot set SIGPIPE handler: {}", e);
         }
 
         let stats_action = signal::SigAction::new(
