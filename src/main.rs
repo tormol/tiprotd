@@ -43,6 +43,7 @@ mod helpers;
 use helpers::*;
 mod discard;
 mod echo;
+mod chargen;
 mod shortsend;
 mod signal;
 
@@ -76,6 +77,7 @@ pub enum ServiceSocket {
     SignalReceiver(signal::SignalReceiver),
     Discard(discard::DiscardSocket),
     Echo(echo::EchoSocket),
+    CharGen(chargen::CharGenSocket),
     Qotd(shortsend::QotdSocket),
     Time32(shortsend::Time32Socket),
     Daytime(shortsend::DaytimeSocket),
@@ -86,6 +88,7 @@ impl ServiceSocket {
     fn setup(server: &mut Server) {
         discard::DiscardSocket::setup(server);
         echo::EchoSocket::setup(server);
+        chargen::CharGenSocket::setup(server);
         shortsend::QotdSocket::setup(server);
         shortsend::Time32Socket::setup(server);
         shortsend::DaytimeSocket::setup(server);
@@ -98,6 +101,7 @@ impl ServiceSocket {
         match self {
             ServiceSocket::Discard(discard) => discard.ready(readiness, this_token, server),
             ServiceSocket::Echo(echo) => echo.ready(readiness, this_token, server),
+            ServiceSocket::CharGen(chargen) => chargen.ready(readiness, this_token, server),
             ServiceSocket::Qotd(qotd) => qotd.ready(readiness, this_token, server),
             ServiceSocket::Time32(time32) => time32.ready(readiness, this_token, server),
             ServiceSocket::Daytime(daytime) => daytime.ready(readiness, this_token, server),
@@ -113,6 +117,7 @@ impl ServiceSocket {
         match self {
             ServiceSocket::Discard(discard) => discard.inner_descriptor(),
             ServiceSocket::Echo(echo) => echo.inner_descriptor(),
+            ServiceSocket::CharGen(chargen) => chargen.inner_descriptor(),
             ServiceSocket::Qotd(qotd) => qotd.inner_descriptor(),
             ServiceSocket::Time32(time32) => time32.inner_descriptor(),
             ServiceSocket::Daytime(daytime) => daytime.inner_descriptor(),
