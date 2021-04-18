@@ -23,6 +23,7 @@ use chrono::{TimeZone, Utc, offset::FixedOffset, DateTime, NaiveDateTime};
 use crate::Server;
 use crate::ServiceSocket;
 use crate::helpers::*;
+use crate::client_limiter::ClientState;
 
 fn tcp_shortsend_accept_loop
 (listener: &TcpListener,  server: &mut Server,  service_name: &'static &'static str,  msg: &[u8])
@@ -73,7 +74,7 @@ fn unix_stream_shortsend_accept_loop
                 Ok(wrote) if wrote == msg.len() => stream.end(Ok(0), "/*print unreachable*/"),
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     eprintln!(
-                        "unix stream send buffer appears to have zero capacity! stopping TCP {}",
+                        "unix stream send buffer appears to have zero capacity! stopping uds {}",
                         stream.service_name
                     );
                     remove_listener = true;
@@ -115,7 +116,7 @@ fn unix_seqpacket_shortsend_accept_loop(
                 Ok(wrote) if wrote == msg.len() => conn.end(Ok(0), "/*print unreachable*/"),
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                     eprintln!(
-                        "unix seqpacket send buffer appears to have zero capacity! stopping TCP {}",
+                        "unix seqpacket send buffer appears to have zero capacity! stopping seqpacket {}",
                         conn.service_name
                     );
                     remove_listener = true;
@@ -149,6 +150,7 @@ fn udp_shortsend(
         socket: &UdpSocket,
         server: &mut Server,
         service_name: &str,
+        require_handshake: bool,
         readiness: Ready,
         outstanding: &mut HashSet<SocketAddr>,
         msg: &[u8]
@@ -160,7 +162,12 @@ fn udp_shortsend(
                 // send errors might be returned on the next read
                 Err(e) => eprintln!("UDP {} error (on receive): {}", service_name, e),
                 Ok((len, from)) => {
-                    if server.limits.allow_unacknowledged_send(from, msg.len()) {
+                    let allowed = if require_handshake {
+                        server.limits.get_unacknowledged_send_state(from) == ClientState::Unlimited
+                    } else {
+                        server.limits.allow_unacknowledged_send(from, msg.len())
+                    };
+                    if allowed {
                         eprintln!("{} udp://{} sends {} bytes for {}",
                             now(), native_addr(from), len, service_name
                         );
@@ -186,6 +193,7 @@ fn udplite_shortsend(
     socket: &UdpLiteSocket,
     server: &mut Server,
     service_name: &str,
+    require_handshake: bool,
     readiness: Ready,
     outstanding: &mut HashSet<SocketAddr>,
     msg: &[u8]
@@ -197,7 +205,12 @@ fn udplite_shortsend(
                 // send errors might be returned on the next read
                 Err(e) => eprintln!("UDP-lite {} error (on receive): {}", service_name, e),
                 Ok((len, from)) => {
-                    if server.limits.allow_unacknowledged_send(from, msg.len()) {
+                    let allowed = if require_handshake {
+                        server.limits.get_unacknowledged_send_state(from) == ClientState::Unlimited
+                    } else {
+                        server.limits.allow_unacknowledged_send(from, msg.len())
+                    };
+                    if allowed {
                         eprintln!("{} udplite://{} sends {} bytes for {}",
                             now(), native_addr(from), len, service_name
                         );
@@ -421,12 +434,8 @@ impl QotdSocket {
             }
             &mut QotdSocket::Udp(ref socket, ref mut outstanding, ref quotes, ref mut pos) => {
                 let status = udp_shortsend(
-                        socket,
-                        server,
-                        "qotd",
-                        readiness,
-                        outstanding,
-                        &quotes[*pos as usize]
+                    socket, server, "qotd", true,
+                    readiness, outstanding, &quotes[*pos as usize],
                 );
                 *pos += 1;
                 *pos %= quotes.len() as u32;
@@ -435,12 +444,8 @@ impl QotdSocket {
             #[cfg(feature="udplite")]
             &mut QotdSocket::UdpLite(ref socket, ref mut outstanding, ref quotes, ref mut pos) => {
                 let status = udplite_shortsend(
-                    socket,
-                    server,
-                    "qotd",
-                    readiness,
-                    outstanding,
-                    &quotes[*pos as usize]
+                    socket, server, "qotd", true,
+                    readiness, outstanding, &quotes[*pos as usize],
                 );
                 *pos += 1;
                 *pos %= quotes.len() as u32;
@@ -451,11 +456,8 @@ impl QotdSocket {
                 let tuple: &mut(_, _, _) = &mut*boxed;
                 let &mut(ref mut outstanding, ref quotes, ref mut pos) = tuple;
                 let status = unix_datagram_shortsend(
-                        socket,
-                        "qotd",
-                        readiness,
-                        outstanding,
-                        &quotes[*pos as usize]
+                    socket, "qotd",
+                    readiness, outstanding, &quotes[*pos as usize],
                 );
                 *pos += 1;
                 *pos %= quotes.len() as u32;
@@ -586,11 +588,14 @@ impl Time32Socket {
                 unix_seqpacket_shortsend_accept_loop(listener, server, &"time32", &sometime)
             }
             &mut Time32Socket::Udp(ref socket, ref mut outstanding) => {
-                udp_shortsend(socket, server, "time32", readiness, outstanding, &sometime)
+                udp_shortsend(socket, server, "time32", false, readiness, outstanding, &sometime)
             }
             #[cfg(feature="udplite")]
             &mut Time32Socket::UdpLite(ref socket, ref mut outstanding) => {
-                udplite_shortsend(socket, server, "time32", readiness, outstanding, &sometime)
+                udplite_shortsend(
+                    socket, server, "time32", false,
+                    readiness, outstanding, &sometime,
+                )
             }
             #[cfg(unix)]
             &mut Time32Socket::UnixDatagram(ref socket, ref mut outstanding) => {
@@ -715,11 +720,14 @@ impl DaytimeSocket {
                 unix_seqpacket_shortsend_accept_loop(listener, server, &"daytime", &somewhere)
             }
             &mut DaytimeSocket::Udp(ref socket, ref mut outstanding) => {
-                udp_shortsend(socket, server, "daytime", readiness, outstanding, &somewhere)
+                udp_shortsend(socket, server, "daytime", false, readiness, outstanding, &somewhere)
             }
             #[cfg(feature="udplite")]
             &mut DaytimeSocket::UdpLite(ref socket, ref mut outstanding) => {
-                udplite_shortsend(socket, server, "daytime", readiness, outstanding, &somewhere)
+                udplite_shortsend(
+                    socket, server, "daytime", false,
+                    readiness, outstanding, &somewhere,
+                )
             }
             #[cfg(unix)]
             &mut DaytimeSocket::UnixDatagram(ref socket, ref mut outstanding) => {

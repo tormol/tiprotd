@@ -19,6 +19,7 @@ use uds::nonblocking::UnixSeqpacketListener;
 use crate::Server;
 use crate::ServiceSocket;
 use crate::helpers::*;
+use crate::client_limiter::ClientState;
 
 const ECHO_PORT: u16 = 7; // read and write
 
@@ -315,14 +316,24 @@ impl EchoSocket {
             &mut Udp(ref socket, ref mut unsent) => {
                 if readiness.is_readable() {
                     let result = udp_receive(socket, server, "echo", |len, from, server| {
-                        if server.limits.allow_unacknowledged_send(from, 2*len) {
-                            eprintln!("{} udp://{} sends {} bytes to echo",
+                        if server.limits.get_unacknowledged_send_state(from)
+                        == ClientState::Unlimited {
+                            eprintln!("{} udp://{} sends {} bytes to echo echo",
                                 now(), native_addr(from), len
                             );
                             // TODO send directly if unsent.is_empty()
                             let msg = Rc::<[u8]>::from(&server.buffer[..len]);
                             unsent.push_back((from, msg.clone()));
                             unsent.push_back((from, msg));
+                        } else if server.limits.allow_unacknowledged_send(from, len-len/2) {
+                            eprintln!("{} udp://{} sends {} bytes to echo half",
+                                now(), native_addr(from), len
+                            );
+                            let msg = &server.buffer[len/2..len];
+                            let sent = unsent.is_empty() && udp_send(socket, msg, &from, "echo");
+                            if !sent {
+                                unsent.push_back((from, Rc::<[u8]>::from(msg)));
+                            }
                         }
                     });
                     if result == Remove {
@@ -345,14 +356,27 @@ impl EchoSocket {
             &mut UdpLite(ref socket, ref mut unsent) => {
                 if readiness.is_readable() {
                     let result = udplite_receive(socket, server, "echo", |len, from, server| {
-                        if server.limits.allow_unacknowledged_send(from, 2*len) {
-                            eprintln!("{} udplite://{} sends {} bytes to echo",
+                        if server.limits.get_unacknowledged_send_state(from)
+                        == ClientState::Unlimited {
+                            eprintln!("{} udplite://{} sends {} bytes to echo echo",
                                 now(), native_addr(from), len
                             );
                             // TODO send directly if unsent.is_empty()
                             let msg = Rc::<[u8]>::from(&server.buffer[..len]);
                             unsent.push_back((from, msg.clone()));
                             unsent.push_back((from, msg));
+                        } else if server.limits.allow_unacknowledged_send(from, len-len/2) {
+                            eprintln!("{} udplite://{} sends {} bytes to echo half",
+                                now(), native_addr(from), len
+                            );
+                            let msg = &server.buffer[len/2..len];
+                            let mut sent = false;
+                            if unsent.is_empty() {
+                                sent = udplite_send(socket, msg, &from, "echo");
+                            }
+                            if !sent {
+                                unsent.push_back((from, Rc::<[u8]>::from(msg)));
+                            }
                         }
                     });
                     if result == Remove {
