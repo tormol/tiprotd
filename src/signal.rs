@@ -10,20 +10,21 @@
 
 #![cfg(unix)]
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{RawFd, AsRawFd, IntoRawFd};
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::io::{Read, ErrorKind::WouldBlock};
 
-use mio::{PollOpt, Ready, Token};
-use mio::net::TcpStream;
-use mio_uds::UnixStream;
+use mio::{Interest, Token, event::Event};
+use mio::net::{TcpStream, UnixStream};
+use mio::unix::pipe;
 use nix::fcntl;
 use nix::sys::signal;
-use nix::unistd::{read, write};
+use nix::unistd::write;
 
 use crate::{Server, helpers::EntryStatus};
 
-static SELFPIPE_WRITER: AtomicIsize = AtomicIsize::new(-1);
+static SELFPIPE_WRITER: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn signal_shutdown(sig: c_int) {
     let fd = SELFPIPE_WRITER.load(Ordering::SeqCst); // performance is a non-issue
@@ -42,7 +43,7 @@ extern "C" fn signal_stats(_: c_int) {
 
 #[derive(Debug)]
 pub struct SignalReceiver {
-    reader: RawFd,
+    reader: pipe::Receiver,
 }
 impl SignalReceiver {
     pub fn setup(server: &mut Server) {
@@ -56,36 +57,31 @@ impl SignalReceiver {
             eprintln!("Cannot ignore SIGTTOU: {}", e);
         }
 
-        // TODO open as CLOEXEC and nonblocking
-        let (reader, writer) = match nix::unistd::pipe() {
+        let (writer, mut reader) = match pipe::new() {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("Cannot create self-pipe: {}, aborting signal-handling", e);
                 return;
             }
         };
-        fcntl::fcntl(reader, fcntl::F_SETFL(fcntl::OFlag::O_NONBLOCK)).unwrap();
-        // if let Ok(default_size) = fcntl::fcntl(reader, fcntl::F_GETPIPE_SZ) {
+        // if let Ok(default_size) = fcntl::fcntl(reader.as_raw_fd(), fcntl::F_GETPIPE_SZ) {
         //     println!("self-pipe buffer size is {}", default_size);
         // }
         #[cfg(any(target_os="linux", target_os="android"))]
-        match fcntl::fcntl(reader, fcntl::F_SETPIPE_SZ(8)) {
+        match fcntl::fcntl(reader.as_raw_fd(), fcntl::F_SETPIPE_SZ(8)) {
             Ok(_set_size) => {/*println!("Set self-pipe buffer size to {}", set_size)*/},
             Err(e) => eprintln!("Cannot set self-pipe buffer size: {}", e),
         }
 
         let entry = server.sockets.vacant_entry();
-        let result = server.poll.register(
-            &mio::unix::EventedFd(&reader),
-            Token(entry.key()),
-            Ready::readable(),
-            PollOpt::edge()
-        );
+        let result = server.poll
+            .registry()
+            .register(&mut reader, Token(entry.key()), Interest::READABLE);
         if let Err(e) = result {
             eprintln!("Cannot register self-pipe: {}, aborting signal-handling", e);
             return;
         }
-        SELFPIPE_WRITER.store(writer as isize, Ordering::SeqCst);
+        SELFPIPE_WRITER.store(writer.into_raw_fd() as i32, Ordering::SeqCst);
         entry.insert(crate::ServiceSocket::SignalReceiver(SignalReceiver{reader}));
         server.internally_shutdown += 1;
 
@@ -121,11 +117,11 @@ impl SignalReceiver {
         }
     }
 
-    pub fn ready(&mut self,  _: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+    pub fn ready(&mut self,  _: &Event,  server: &mut Server) -> EntryStatus {
         // println!("signal ready");
         loop {
-            match read(self.reader, &mut server.buffer) {
-                Err(ref e) if e.as_errno() == Some(nix::errno::EWOULDBLOCK) => return EntryStatus::Drained,
+            match self.reader.read(&mut server.buffer) {
+                Err(ref e) if e.kind() == WouldBlock => return EntryStatus::Drained,
                 Err(e) => {
                     eprintln!("Error reading from self-pipe: {}", e);
                     return EntryStatus::Remove;
@@ -144,7 +140,7 @@ impl SignalReceiver {
     }
 
     pub fn inner_descriptor(&self) -> Option<&(dyn crate::helpers::Descriptor+'static)> {
-        None // TODO proper type
+        Some(&self.reader)
     }
 }
 

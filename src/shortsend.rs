@@ -7,14 +7,14 @@ use std::rc::Rc;
 use std::time::SystemTime;
 use std::mem::size_of;
 
-use mio::{Ready, Token};
+use mio::{Interest, Token, event::Event};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(feature="udplite")]
 use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use uds::{UnixSocketAddr, UnixDatagramExt};
 #[cfg(unix)]
-use mio_uds::{UnixDatagram, UnixListener};
+use mio::net::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
 use uds::nonblocking::UnixSeqpacketListener;
 use rand::seq::SliceRandom;
@@ -29,7 +29,7 @@ fn tcp_shortsend_accept_loop
 (listener: &TcpListener,  server: &mut Server,  service_name: &'static &'static str,  msg: &[u8])
 -> EntryStatus {
     let mut remove_listener = false;
-    let accept_result = tcp_accept_loop(listener, server, service_name, Ready::writable(),
+    let accept_result = tcp_accept_loop(listener, server, service_name, Interest::WRITABLE,
         |stream| {
             match stream.write(msg) {
                 Ok(wrote) if wrote == msg.len() => stream.end(Ok(0), "/*print unreachable*/"),
@@ -68,7 +68,7 @@ fn unix_stream_shortsend_accept_loop
 (listener: &UnixListener,  server: &mut Server,  service_name: &'static &'static str,  msg: &[u8])
 -> EntryStatus {
     let mut remove_listener = false;
-    let accept_result = unix_stream_accept_loop(listener, server, service_name, Ready::writable(),
+    let accept_result = unix_stream_accept_loop(listener, server, service_name, Interest::WRITABLE,
         |stream| {
             match stream.write(msg) {
                 Ok(wrote) if wrote == msg.len() => stream.end(Ok(0), "/*print unreachable*/"),
@@ -110,7 +110,7 @@ fn unix_seqpacket_shortsend_accept_loop(
     service_name: &'static &'static str,  msg: &[u8]
 ) -> EntryStatus {
     let mut remove_listener = false;
-    let accept_result = unix_seqpacket_accept_loop(listener, server, service_name, Ready::writable(),
+    let accept_result = unix_seqpacket_accept_loop(listener, server, service_name, Interest::WRITABLE,
         |conn| {
             match conn.send(msg) {
                 Ok(wrote) if wrote == msg.len() => conn.end(Ok(0), "/*print unreachable*/"),
@@ -151,11 +151,11 @@ fn udp_shortsend(
         server: &mut Server,
         service_name: &str,
         require_handshake: bool,
-        readiness: Ready,
+        event: &Event,
         outstanding: &mut HashSet<SocketAddr>,
         msg: &[u8]
 ) -> EntryStatus {
-    if readiness.is_readable() {
+    if event.is_readable() {
         loop {
             match socket.recv_from(&mut server.buffer) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -194,11 +194,11 @@ fn udplite_shortsend(
     server: &mut Server,
     service_name: &str,
     require_handshake: bool,
-    readiness: Ready,
+    event: &Event,
     outstanding: &mut HashSet<SocketAddr>,
     msg: &[u8]
 ) -> EntryStatus {
-    if readiness.is_readable() {
+    if event.is_readable() {
         loop {
             match socket.recv_from(&mut server.buffer) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -236,11 +236,11 @@ fn udplite_shortsend(
 fn unix_datagram_shortsend(
         socket: &UnixDatagram,
         service_name: &str,
-        readiness: Ready,
+        event: &Event,
         outstanding: &mut Vec<UnixSocketAddr>,
         msg: &[u8],
 ) -> EntryStatus {
-    if readiness.is_readable() {
+    if event.is_readable() {
         loop {
             match socket.recv_from_unix_addr(&mut [0; 32]) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -359,13 +359,13 @@ impl QotdSocket {
         listen_tcp(server, "qotd", QOTD_PORT, &mut|listener, Token(_)| {
             ServiceSocket::Qotd(QotdSocket::TcpListener(listener, quotes.clone(), 0))
         });
-        listen_udp(server, "qotd", QOTD_PORT, Ready::readable() | Ready::writable(),
+        listen_udp(server, "qotd", QOTD_PORT, Interest::READABLE | Interest::WRITABLE,
             &mut|socket, Token(_)| {
                 ServiceSocket::Qotd(QotdSocket::Udp(socket, HashSet::new(), quotes.clone(), 0))
             }
         );
         #[cfg(feature="udplite")]
-        listen_udplite(server, "qotd", QOTD_PORT, Ready::readable() | Ready::writable(), Some(0),
+        listen_udplite(server, "qotd", QOTD_PORT, Interest::READABLE | Interest::WRITABLE, Some(0),
             &mut|socket, Token(_)| {
                 ServiceSocket::Qotd(QotdSocket::UdpLite(socket, HashSet::new(), quotes.clone(), 0))
             }
@@ -375,7 +375,7 @@ impl QotdSocket {
             ServiceSocket::Qotd(QotdSocket::UnixStreamListener(listener, quotes.clone(), 0))
         });
         #[cfg(unix)]
-        UnixSocketWrapper::create_datagram_socket("qotd", Ready::all(), server,
+        UnixSocketWrapper::create_datagram_socket("qotd", Interest::READABLE | Interest::WRITABLE, server,
             &mut|socket, Token(_)| {
                 let state = Box::new((Vec::new(), quotes.clone(), 0));
                 ServiceSocket::Qotd(QotdSocket::UnixDatagram(socket, state))
@@ -386,7 +386,7 @@ impl QotdSocket {
             ServiceSocket::Qotd(QotdSocket::UnixSeqpacketListener(listener, quotes.clone(), 0))
         });
         #[cfg(feature="posixmq")]
-        listen_posixmq(server, "qotd", Ready::writable(),
+        listen_posixmq(server, "qotd", Interest::WRITABLE,
             posixmq::OpenOptions::writeonly()
                 .mode(0o644)
                 .max_msg_len(quotes.iter().map(|quote| quote.len() ).max().unwrap_or(0))
@@ -395,7 +395,7 @@ impl QotdSocket {
         );
     }
 
-    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+    pub fn ready(&mut self,  event: &Event,  server: &mut Server) -> EntryStatus {
         match self {
             &mut QotdSocket::TcpListener(ref listener, ref quotes, ref mut pos) => {
                 let status = tcp_shortsend_accept_loop(
@@ -435,7 +435,7 @@ impl QotdSocket {
             &mut QotdSocket::Udp(ref socket, ref mut outstanding, ref quotes, ref mut pos) => {
                 let status = udp_shortsend(
                     socket, server, "qotd", true,
-                    readiness, outstanding, &quotes[*pos as usize],
+                    event, outstanding, &quotes[*pos as usize],
                 );
                 *pos += 1;
                 *pos %= quotes.len() as u32;
@@ -445,7 +445,7 @@ impl QotdSocket {
             &mut QotdSocket::UdpLite(ref socket, ref mut outstanding, ref quotes, ref mut pos) => {
                 let status = udplite_shortsend(
                     socket, server, "qotd", true,
-                    readiness, outstanding, &quotes[*pos as usize],
+                    event, outstanding, &quotes[*pos as usize],
                 );
                 *pos += 1;
                 *pos %= quotes.len() as u32;
@@ -457,7 +457,7 @@ impl QotdSocket {
                 let &mut(ref mut outstanding, ref quotes, ref mut pos) = tuple;
                 let status = unix_datagram_shortsend(
                     socket, "qotd",
-                    readiness, outstanding, &quotes[*pos as usize],
+                    event, outstanding, &quotes[*pos as usize],
                 );
                 *pos += 1;
                 *pos %= quotes.len() as u32;
@@ -548,11 +548,11 @@ impl Time32Socket {
         listen_tcp(server, "time32", TIME32_PORT,
             &mut|listener, Token(_)| ServiceSocket::Time32(Time32Socket::TcpListener(listener))
         );
-        listen_udp(server, "time32", TIME32_PORT, Ready::readable() | Ready::writable(),
+        listen_udp(server, "time32", TIME32_PORT, Interest::READABLE | Interest::WRITABLE,
             &mut|socket, Token(_)| ServiceSocket::Time32(Time32Socket::Udp(socket, HashSet::new()))
         );
         #[cfg(feature="udplite")]
-        listen_udplite(server, "time32", TIME32_PORT, Ready::readable() | Ready::writable(), Some(0),
+        listen_udplite(server, "time32", TIME32_PORT, Interest::READABLE | Interest::WRITABLE, Some(0),
             &mut|socket, Token(_)| {
                 ServiceSocket::Time32(Time32Socket::UdpLite(socket, HashSet::new()))
             }
@@ -562,7 +562,7 @@ impl Time32Socket {
             ServiceSocket::Time32(Time32Socket::UnixStreamListener(listener))
         });
         #[cfg(unix)]
-        UnixSocketWrapper::create_datagram_socket("time32", Ready::all(), server,
+        UnixSocketWrapper::create_datagram_socket("time32", Interest::READABLE | Interest::WRITABLE, server,
             &mut|socket, Token(_)| {
                 ServiceSocket::Time32(Time32Socket::UnixDatagram(socket, Vec::new()))
             }
@@ -573,7 +573,7 @@ impl Time32Socket {
         });
     }
 
-    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+    pub fn ready(&mut self,  event: &Event,  server: &mut Server) -> EntryStatus {
         let sometime = new_time32();
         match self {
             &mut Time32Socket::TcpListener(ref listener) => {
@@ -588,18 +588,15 @@ impl Time32Socket {
                 unix_seqpacket_shortsend_accept_loop(listener, server, &"time32", &sometime)
             }
             &mut Time32Socket::Udp(ref socket, ref mut outstanding) => {
-                udp_shortsend(socket, server, "time32", false, readiness, outstanding, &sometime)
+                udp_shortsend(socket, server, "time32", false, event, outstanding, &sometime)
             }
             #[cfg(feature="udplite")]
             &mut Time32Socket::UdpLite(ref socket, ref mut outstanding) => {
-                udplite_shortsend(
-                    socket, server, "time32", false,
-                    readiness, outstanding, &sometime,
-                )
+                udplite_shortsend(socket, server, "time32", false, event, outstanding, &sometime)
             }
             #[cfg(unix)]
             &mut Time32Socket::UnixDatagram(ref socket, ref mut outstanding) => {
-                unix_datagram_shortsend(socket, "time32", readiness, outstanding, &sometime)
+                unix_datagram_shortsend(socket, "time32", event, outstanding, &sometime)
             }
         }
     }
@@ -678,13 +675,15 @@ impl DaytimeSocket {
         listen_tcp(server, "daytime", DAYTIME_PORT,
             &mut|listener, Token(_)| ServiceSocket::Daytime(DaytimeSocket::TcpListener(listener))
         );
-        listen_udp(server, "daytime", DAYTIME_PORT, Ready::readable() | Ready::writable(),
+        listen_udp(server, "daytime", DAYTIME_PORT, Interest::READABLE | Interest::WRITABLE,
             &mut|socket, Token(_)| {
                 ServiceSocket::Daytime(DaytimeSocket::Udp(socket, HashSet::new()))
             }
         );
         #[cfg(feature="udplite")]
-        listen_udplite(server, "daytime", DAYTIME_PORT, Ready::readable() | Ready::writable(), Some(10),
+        listen_udplite(
+            server, "daytime", DAYTIME_PORT,
+            Interest::READABLE | Interest::WRITABLE, Some(10),
             &mut|socket, Token(_)| {
                 ServiceSocket::Daytime(DaytimeSocket::UdpLite(socket, HashSet::new()))
             }
@@ -694,7 +693,10 @@ impl DaytimeSocket {
             ServiceSocket::Daytime(DaytimeSocket::UnixStreamListener(listener))
         });
         #[cfg(unix)]
-        UnixSocketWrapper::create_datagram_socket("daytime", Ready::all(), server,
+        UnixSocketWrapper::create_datagram_socket(
+            "daytime",
+            Interest::READABLE | Interest::WRITABLE,
+            server,
             &mut|socket, Token(_)| {
                 ServiceSocket::Daytime(DaytimeSocket::UnixDatagram(socket, Vec::new()))
             }
@@ -705,7 +707,7 @@ impl DaytimeSocket {
         });
     }
 
-    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+    pub fn ready(&mut self,  event: &Event,  server: &mut Server) -> EntryStatus {
         let somewhere = new_daytime().into_bytes();
         match self {
             &mut DaytimeSocket::TcpListener(ref listener) => {
@@ -720,18 +722,15 @@ impl DaytimeSocket {
                 unix_seqpacket_shortsend_accept_loop(listener, server, &"daytime", &somewhere)
             }
             &mut DaytimeSocket::Udp(ref socket, ref mut outstanding) => {
-                udp_shortsend(socket, server, "daytime", false, readiness, outstanding, &somewhere)
+                udp_shortsend(socket, server, "daytime", false, event, outstanding, &somewhere)
             }
             #[cfg(feature="udplite")]
             &mut DaytimeSocket::UdpLite(ref socket, ref mut outstanding) => {
-                udplite_shortsend(
-                    socket, server, "daytime", false,
-                    readiness, outstanding, &somewhere,
-                )
+                udplite_shortsend(socket, server, "daytime", false, event, outstanding, &somewhere)
             }
             #[cfg(unix)]
             &mut DaytimeSocket::UnixDatagram(ref socket, ref mut outstanding) => {
-                unix_datagram_shortsend(socket, "daytime", readiness, outstanding, &somewhere)
+                unix_datagram_shortsend(socket, "daytime", event, outstanding, &somewhere)
             }
         }
     }
@@ -772,7 +771,10 @@ impl SysstatSocket {
             ServiceSocket::Sysstat(SysstatSocket::UnixStreamListener(listener))
         });
         #[cfg(unix)]
-        UnixSocketWrapper::create_datagram_socket("sysstat", Ready::all(), server,
+        UnixSocketWrapper::create_datagram_socket(
+            "sysstat",
+            Interest::READABLE | Interest::WRITABLE,
+            server,
             &mut|socket, Token(_)| {
                 ServiceSocket::Sysstat(SysstatSocket::UnixDatagram(socket, Vec::new()))
             }
@@ -783,7 +785,7 @@ impl SysstatSocket {
         });
     }
 
-    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+    pub fn ready(&mut self,  event: &Event,  server: &mut Server) -> EntryStatus {
         let status = format!(
 "sockets: {}
 receive buffer size: {}B
@@ -795,11 +797,14 @@ entry size: {}B
             }
             #[cfg(feature="seqpacket")]
             &mut SysstatSocket::UnixSeqpacketListener(ref listener) => {
-                unix_seqpacket_shortsend_accept_loop(listener, server, &"sysstat", status.as_bytes())
+                unix_seqpacket_shortsend_accept_loop(
+                    listener, server, &"sysstat",
+                    status.as_bytes(),
+                )
             }
             #[cfg(unix)]
             &mut SysstatSocket::UnixDatagram(ref socket, ref mut outstanding) => {
-                unix_datagram_shortsend(socket, "sysstat", readiness, outstanding, status.as_bytes())
+                unix_datagram_shortsend(socket, "sysstat", event, outstanding, status.as_bytes())
             }
         }
     }

@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::fmt::{self, Debug, Formatter};
 
 use sctp_crate::SctpEndpoint;
-use mio::{Evented, unix::EventedFd, Poll, Token, Ready, PollOpt};
+use mio::{event::Source, unix::SourceFd, Registry, Token, Interest};
 use libc::{ioctl, FIONBIO};
 
 pub struct SctpSocket(SctpEndpoint);
@@ -33,17 +33,17 @@ impl SctpSocket {
     }
 }
 
-impl Evented for SctpSocket {
-    fn register(&self,  poll: &Poll,  token: Token,  interest: Ready,  opts: PollOpt)
+impl Source for SctpSocket {
+    fn register(&mut self,  registry: &Registry,  token: Token,  interest: Interest)
     -> Result<(), io::Error> {
-        EventedFd(&self.0.as_raw_fd()).register(poll, token, interest, opts)
+        SourceFd(&self.0.as_raw_fd()).register(registry, token, interest)
     }
-    fn reregister(&self,  poll: &Poll,  token: Token,  interest: Ready,  opts: PollOpt)
+    fn reregister(&mut self,  registry: &Registry,  token: Token,  interest: Interest)
     -> Result<(), io::Error> {
-        EventedFd(&self.0.as_raw_fd()).reregister(poll, token, interest, opts)
+        SourceFd(&self.0.as_raw_fd()).reregister(registry, token, interest)
     }
-    fn deregister(&self,  poll: &Poll) -> Result<(), io::Error> {
-        EventedFd(&self.0.as_raw_fd()).deregister(poll)
+    fn deregister(&mut self,  registry: &Registry) -> Result<(), io::Error> {
+        SourceFd(&self.0.as_raw_fd()).deregister(registry)
     }
 }
 

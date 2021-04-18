@@ -2,17 +2,17 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::path::Path;
 use std::fmt::{self, Debug};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Write, IoSlice};
 use std::net::{Shutdown, SocketAddr};
 
-use mio::{IoVec, Ready, Token};
+use mio::{Interest, Token, event::Event};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(feature="udplite")]
 use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use uds::{UnixSocketAddr, UnixDatagramExt};
 #[cfg(unix)]
-use mio_uds::{UnixDatagram, UnixListener};
+use mio::net::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
 use uds::nonblocking::UnixSeqpacketListener;
 
@@ -111,7 +111,7 @@ impl CharGenSocket {
         listen_tcp(server, "chargen", CHARGEN_PORT,
             &mut|listener, Token(_)| ServiceSocket::CharGen(TcpListener(listener, content.text))
         );
-        listen_udp(server, "chargen", CHARGEN_PORT, Ready::readable() | Ready::writable(),
+        listen_udp(server, "chargen", CHARGEN_PORT, Interest::READABLE | Interest::WRITABLE,
             &mut|socket, Token(_)| {
                 ServiceSocket::CharGen(Udp(socket, content.clone(), VecDeque::new()))
             }
@@ -119,7 +119,7 @@ impl CharGenSocket {
         #[cfg(feature="udplite")]
         listen_udplite(
             server, "chargen", CHARGEN_PORT,
-            Ready::readable() | Ready::writable(),
+            Interest::READABLE | Interest::WRITABLE,
             Some(0),
             &mut|socket, Token(_)| {
                 ServiceSocket::CharGen(UdpLite(socket, content.clone(), VecDeque::new()))
@@ -138,17 +138,20 @@ impl CharGenSocket {
             }
         );
         #[cfg(unix)]
-        UnixSocketWrapper::create_datagram_socket("chargen", Ready::all(), server,
+        UnixSocketWrapper::create_datagram_socket(
+            "chargen",
+            Interest::READABLE | Interest::WRITABLE,
+            server,
             &mut|socket, Token(_)| {
                 ServiceSocket::CharGen(UnixDatagram(socket, content.clone(), VecDeque::new()))
             }
         );
     }
 
-    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+    pub fn ready(&mut self,  readiness: &Event,  server: &mut Server) -> EntryStatus {
         match self {
             &mut TcpListener(ref listener, text) => {
-                tcp_accept_loop(listener, server, &"chargen", Ready::writable(),
+                tcp_accept_loop(listener, server, &"chargen", Interest::WRITABLE,
                     |stream| {
                         if stream.shutdown(Shutdown::Read) == Remove {
                             None
@@ -165,13 +168,10 @@ impl CharGenSocket {
                 loop {
                     *sent_offset %= text.len() as u32;
                     let (sent, remaining) = text.split_at(*sent_offset as usize);
-                    let result = match IoVec::from_bytes(sent) {
-                        Some(sent) => stream.write_bufs(&[
-                            IoVec::from_bytes(remaining).unwrap(),
-                            sent,
-                        ]),
-                        None => stream.write(remaining),
-                    };
+                    let result = stream.write_vectored(&[
+                        IoSlice::new(remaining),
+                        IoSlice::new(sent),
+                    ]);
                     match result {
                         Ok(sent) => *sent_offset += sent as u32,
                         Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Drained,
@@ -280,7 +280,7 @@ impl CharGenSocket {
             }
             #[cfg(unix)]
             &mut UnixStreamListener(ref listener, text) => {
-                unix_stream_accept_loop(listener, server, &"chargen", Ready::writable(),
+                unix_stream_accept_loop(listener, server, &"chargen", Interest::WRITABLE,
                     |stream| {
                         if stream.shutdown(Shutdown::Read) {
                             return None;
@@ -310,7 +310,7 @@ impl CharGenSocket {
             }
             #[cfg(feature="seqpacket")]
             &mut UnixSeqpacketListener(ref listener, text) => {
-                unix_seqpacket_accept_loop(listener, server, &"chargen", Ready::writable(),
+                unix_seqpacket_accept_loop(listener, server, &"chargen", Interest::WRITABLE,
                     |conn| {
                         match conn.send(text) {
                             Ok(all) if all == text.len() => {},

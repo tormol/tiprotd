@@ -24,8 +24,6 @@ extern crate sctp as sctp_crate;
 #[cfg(feature="udplite")]
 extern crate udplite;
 #[cfg(unix)]
-extern crate mio_uds;
-#[cfg(unix)]
 extern crate uds;
 #[cfg(feature="posixmq")]
 extern crate posixmq;
@@ -52,7 +50,8 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::mem;
 use std::time::Duration;
 
-use mio::{Token, Poll, PollOpt, Ready, Events};
+use mio::{Poll, Events, Interest, Token};
+use mio::event::{Source, Event};
 use slab::Slab;
 
 
@@ -96,20 +95,23 @@ impl ServiceSocket {
         #[cfg(unix)]
         signal::SignalReceiver::setup(server);
     }
-    fn ready(&mut self,  readiness: Ready,  this_token: Token,  server: &mut Server)
+    fn ready(&mut self,  event: &Event,  server: &mut Server)
     -> helpers::EntryStatus {
         match self {
-            ServiceSocket::Discard(discard) => discard.ready(readiness, this_token, server),
-            ServiceSocket::Echo(echo) => echo.ready(readiness, this_token, server),
-            ServiceSocket::CharGen(chargen) => chargen.ready(readiness, this_token, server),
-            ServiceSocket::Qotd(qotd) => qotd.ready(readiness, this_token, server),
-            ServiceSocket::Time32(time32) => time32.ready(readiness, this_token, server),
-            ServiceSocket::Daytime(daytime) => daytime.ready(readiness, this_token, server),
-            ServiceSocket::Sysstat(sysstat) => sysstat.ready(readiness, this_token, server),
+            ServiceSocket::Discard(discard) => discard.ready(event, server),
+            ServiceSocket::Echo(echo) => echo.ready(event, server),
+            ServiceSocket::CharGen(chargen) => chargen.ready(event, server),
+            ServiceSocket::Qotd(qotd) => qotd.ready(event, server),
+            ServiceSocket::Time32(time32) => time32.ready(event, server),
+            ServiceSocket::Daytime(daytime) => daytime.ready(event, server),
+            ServiceSocket::Sysstat(sysstat) => sysstat.ready(event, server),
             #[cfg(unix)]
-            ServiceSocket::SignalReceiver(sr) => sr.ready(readiness, this_token, server),
+            ServiceSocket::SignalReceiver(sr) => sr.ready(event, server),
             ServiceSocket::CurrentlyMoved => {
-                unreachable!("CurrentlyMoved at {} not replaced or removed", this_token.0)
+                unreachable!(
+                    "CurrentlyMoved at {} not replaced or removed",
+                    event.token().0,
+                )
             }
         }
     }
@@ -155,22 +157,22 @@ impl Server {
         }
     }
 
-    fn try_bind_ip<S: mio::Evented>(&mut self,
+    fn try_bind_ip<S: Source>(&mut self,
             protocol_name: &str,  service_name: &str,  port: u16,
-            poll_for: Ready,  binder: fn(SocketAddr)->io::Result<S>,
+            interest: Interest,  binder: fn(SocketAddr)->io::Result<S>,
     ) -> Option<(S, slab::VacantEntry<ServiceSocket>)> {
         let on = SocketAddr::from((ANY, port+self.port_offset.unwrap_or(0)));
         match binder(on) {
-            Ok(socket) => {
+            Ok(mut socket) => {
                 let entry = self.sockets.vacant_entry();
-                self.poll.register(&socket, Token(entry.key()), poll_for, PollOpt::edge())
+                self.poll.registry().register(&mut socket, Token(entry.key()), interest)
                     .expect(&format!("Cannot register {} listener", protocol_name));
                 Some((socket, entry))
             }
             Err(ref e) if e.kind() == ErrorKind::PermissionDenied && self.port_offset == None => {
                 eprintln!("Doesn't have permission to listen on reserved ports, falling back to 10_000+port");
                 self.port_offset = Some(NONRESERVED_PORT_OFFSET);
-                self.try_bind_ip(protocol_name, service_name, port, poll_for, binder)
+                self.try_bind_ip(protocol_name, service_name, port, interest, binder)
             }
             Err(e) => {
                 eprintln!("Cannot listen on {}://{} (for {}): {}",
@@ -181,18 +183,19 @@ impl Server {
         }
     }
 
-    fn trigger(&mut self,  readiness: Ready,  mut socket: ServiceSocket,  token: Token) {
-        match socket.ready(readiness, token, self) {
+    fn trigger(&mut self,  event: &Event,  mut socket: ServiceSocket) {
+        let Token(index) = event.token();
+        match socket.ready(event, self) {
             Drained => {
-                match mem::replace(&mut self.sockets[token.0], socket) {
+                match mem::replace(&mut self.sockets[index], socket) {
                     ServiceSocket::CurrentlyMoved => {},
-                    _ => eprintln!("Replaced non-moved socket entry at {}!", token.0),
+                    _ => eprintln!("Replaced non-moved socket entry at {}!", index),
                 }
             }
             Remove => {
-                match self.sockets.remove(token.0) {
+                match self.sockets.remove(index) {
                     ServiceSocket::CurrentlyMoved => {},
-                    _ => eprintln!("Removed non-moved socket entry at {}!", token.0),
+                    _ => eprintln!("Removed non-moved socket entry at {}!", index),
                 }
             }
             Unfinished => unimplemented!()
@@ -218,7 +221,7 @@ fn main() {
                     continue;
                 }
             };
-            server.trigger(event.readiness(), entry, event.token());
+            server.trigger(event, entry);
         }
         if server.sockets.capacity() > 20
         && server.sockets.capacity() / 8 > server.sockets.len() {

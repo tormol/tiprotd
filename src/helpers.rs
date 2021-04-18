@@ -11,12 +11,12 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::raw::c_int;
 
 use chrono::Local;
-use mio::{Evented, PollOpt, Ready, Token};
+use mio::{event::Source, Interest, Token};
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(feature="udplite")]
 use udplite::UdpLiteSocket;
 #[cfg(unix)]
-use mio_uds::{UnixListener, UnixStream, UnixDatagram};
+use mio::net::{UnixListener, UnixStream, UnixDatagram};
 #[cfg(unix)]
 use uds::{UnixSocketAddr, UnixListenerExt, UnixDatagramExt};
 #[cfg(feature="seqpacket")]
@@ -78,19 +78,19 @@ impl Display for Protocol {
 }
 
 #[cfg(unix)]
-pub trait Descriptor: AsRawFd + Evented + Any+'static {
+pub trait Descriptor: AsRawFd + Source + Any+'static {
     fn as_any(&self) -> &(dyn Any+'static);
 }
 #[cfg(unix)]
-impl<T: AsRawFd+Evented+Any+Sized> Descriptor for T {
+impl<T: AsRawFd+Source+Any+Sized> Descriptor for T {
     fn as_any(&self) -> &(dyn Any+'static) {
         self
     }
 }
 #[cfg(not(unix))]
-pub trait Descriptor: Evented + Any {}
+pub trait Descriptor: Source + Any {}
 #[cfg(not(unix))]
-impl<T: Evented+Any> Descriptor for T {}
+impl<T: Source+Any> Descriptor for T {}
 
 // pub enum Socket<'a> {
 //     TcpStream(&'a TcpStream),
@@ -232,11 +232,11 @@ pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
         encapsulate: &mut dyn FnMut(TcpListener, Token)->ServiceSocket
 ) {
     #[cfg(not(unix))]
-    let res = server.try_bind_ip("tcp", service_name, port, Ready::readable(),
+    let res = server.try_bind_ip("tcp", service_name, port, Interest::READABLE,
         |addr| TcpListener::bind(&addr)
     );
     #[cfg(unix)]
-    let res = server.try_bind_ip("tcp", service_name, port, Ready::readable(),
+    let res = server.try_bind_ip("tcp", service_name, port, Interest::READABLE,
         |addr| {
             let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
             let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
@@ -290,7 +290,7 @@ pub fn tcp_accept_loop<
         W: FnMut(TcpStreamWrapper, P, Token) -> ServiceSocket
 >(
         listener: &TcpListener,  server: &mut Server,
-        service_name: &'static &'static str,  poll_streams_for: Ready,
+        service_name: &'static &'static str,  poll_streams_for: Interest,
         mut trier: T,  mut wrapper: W
 ) -> EntryStatus {
     loop {
@@ -361,17 +361,16 @@ pub fn tcp_accept_loop<
                 );
                 if let Some(state) = trier(&mut stream) {
                     let entry = server.sockets.vacant_entry();
-                    let result = server.poll.register(&*stream,
+                    let result = server.poll.registry().register(&mut*stream,
                         Token(entry.key()),
                         poll_streams_for,
-                        PollOpt::edge(),
                     );
                     if let Err(e) = result {
                         eprintln!("Cannot register TCP connection: {}", e);
                     } else {
                         let token = Token(entry.key()); // make borrowck happy
                         entry.insert(wrapper(stream, state, token));
-                        // TODO trigger Ready::readable() | Ready::writable()
+                        // TODO trigger Interest::READABLE | Interest::WRITABLE
                     }
                 }
             }
@@ -442,7 +441,7 @@ pub fn listen_sctp(server: &mut Server,  service_name: &'static str,  port: u16,
     if server.failed_protocols.contains(&Protocol::Sctp) {
         return;
     }
-    let res = server.try_bind_ip("sctp", service_name, port, Ready::readable(),
+    let res = server.try_bind_ip("sctp", service_name, port, Interest::READABLE,
         |addr| SctpSocket::bind(addr)
     );
     if let Some((listener, entry)) = res {
@@ -461,7 +460,7 @@ pub fn listen_dccp(server: &mut Server,  service_name: &'static str,  port: u16,
     if server.failed_protocols.contains(&Protocol::Dccp) {
         return;
     }
-    let res = server.try_bind_ip("dccp", service_name, port, Ready::readable(),
+    let res = server.try_bind_ip("dccp", service_name, port, Interest::READABLE,
         |addr| {
             let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
             let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
@@ -484,11 +483,11 @@ pub fn listen_dccp(server: &mut Server,  service_name: &'static str,  port: u16,
 
 /// Create a mio UdpSocket bound to the specified port and register it.
 pub fn listen_udp(server: &mut Server,  service_name: &'static str,
-        port: u16,  poll_for: Ready,
+        port: u16,  poll_for: Interest,
         encapsulate: &mut dyn FnMut(UdpSocket, Token)->ServiceSocket
 ) {
     let (socket, entry) = server.try_bind_ip("udp", service_name, port, poll_for,
-        |addr| UdpSocket::bind(&addr)
+        |addr| UdpSocket::bind(addr)
     ).unwrap_or_else(|| std::process::exit(1) );
     let token = Token(entry.key()); // make borrowck happy
     entry.insert(encapsulate(socket, token));
@@ -499,7 +498,7 @@ pub fn listen_udp(server: &mut Server,  service_name: &'static str,
 /// bound to the specified port and register it.
 #[cfg(feature="udplite")]
 pub fn listen_udplite(server: &mut Server,  service_name: &'static str,
-        port: u16,  poll_for: Ready,  send_cscov: Option<u16>,
+        port: u16,  poll_for: Interest,  send_cscov: Option<u16>,
         encapsulate: &mut dyn FnMut(UdpLiteSocket, Token)->ServiceSocket
 ) {
     if server.failed_protocols.contains(&Protocol::Udplite) {
@@ -606,13 +605,13 @@ impl<S: Descriptor> UnixSocketWrapper<S> {
             }
         }
     }
-    fn register(self,  socket_type: &str,
-            poll_for: Ready,  server: &mut Server,
+    fn register(mut self,  socket_type: &str,
+            poll_for: Interest,  server: &mut Server,
             encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
         let entry = server.sockets.vacant_entry();
         let token = Token(entry.key());
-        match server.poll.register(&self.0, token, poll_for, PollOpt::edge()) {
+        match server.poll.registry().register(&mut self.0, token, poll_for) {
             Ok(()) => {entry.insert(encapsulate(self, token));}
             Err(e) => {panic!("Cannot register unix {}: {}", socket_type, e)}
         }
@@ -626,20 +625,20 @@ impl UnixSocketWrapper<UnixListener> {
         let path_name = format!("{}.socket", service_name);
         let res = Self::create_path(path_name, server, |path| UnixListener::bind(path) );
         if let Some(socket) = res {
-            socket.register("stream listener", Ready::readable(), server, encapsulate);
+            socket.register("stream listener", Interest::READABLE, server, encapsulate);
 
             let res = Self::create_abstract(service_name, server, |addr| {
                 UnixListener::bind_unix_addr(addr)
             });
             if let Some(socket) = res {
-                socket.register("stream listener", Ready::readable(), server, encapsulate);
+                socket.register("stream listener", Interest::READABLE, server, encapsulate);
             }
         }
     }
 }
 #[cfg(unix)]
 impl UnixSocketWrapper<UnixDatagram> {
-    pub fn create_datagram_socket(service_name: &str,  poll_for: Ready,
+    pub fn create_datagram_socket(service_name: &str,  poll_for: Interest,
             server: &mut Server,  encapsulate: &mut dyn FnMut(Self, Token)->ServiceSocket
     ) {
         let path_name = format!("{}_dgram.socket", service_name);
@@ -670,14 +669,14 @@ impl UnixSocketWrapper<UnixSeqpacketListener> {
             UnixSeqpacketListener::bind(&path)
         });
         if let Some(socket) = res {
-            socket.register("seqpacket listener", Ready::readable(), server, encapsulate);
+            socket.register("seqpacket listener", Interest::READABLE, server, encapsulate);
 
             let abstract_name = format!("{}_seqpacket", service_name);
             let res = Self::create_abstract(&abstract_name, server, |name| {
                 UnixSeqpacketListener::bind_unix_addr(name)
             });
             if let Some(socket) = res {
-                socket.register("seqpacket listener", Ready::readable(), server, encapsulate);
+                socket.register("seqpacket listener", Interest::READABLE, server, encapsulate);
             }
         } else {
             eprintln!("Not starting seqpacket protocol variants");
@@ -730,7 +729,7 @@ pub fn unix_stream_accept_loop<
         W: FnMut(UnixStreamWrapper, P, Token) -> ServiceSocket
 >(
         listener: &UnixListener,  server: &mut Server,
-        service_name: &'static &'static str,  poll_stream_for: Ready,
+        service_name: &'static &'static str,  poll_stream_for: Interest,
         mut trier: T,  mut wrapper: W
 ) -> EntryStatus {
     loop {
@@ -752,10 +751,10 @@ pub fn unix_stream_accept_loop<
                 );
                 if let Some(state) = trier(&mut stream) {
                     let entry = server.sockets.vacant_entry();
-                    let result = server.poll.register(&*stream,
+                    let result = server.poll.registry().register(
+                        &mut*stream,
                         Token(entry.key()),
                         poll_stream_for,
-                        PollOpt::edge(),
                     );
                     if let Err(e) = result {
                         eprintln!("Cannot register unix stream connection: {}", e);
@@ -827,7 +826,7 @@ pub fn unix_seqpacket_accept_loop<
         W: FnMut(UnixSeqpacketConnWrapper, P, Token) -> ServiceSocket
 >(
         listener: &UnixSeqpacketListener,  server: &mut Server,
-        service_name: &'static &'static str,  poll_stream_for: Ready,
+        service_name: &'static &'static str,  poll_stream_for: Interest,
         mut trier: T,  mut wrapper: W
 ) -> EntryStatus {
     loop {
@@ -849,11 +848,10 @@ pub fn unix_seqpacket_accept_loop<
                 );
                 if let Some(state) = trier(&mut conn) {
                     let entry = server.sockets.vacant_entry();
-                    let result = server.poll.register(
-                        &*conn,
+                    let result = server.poll.registry().register(
+                        &mut*conn,
                         Token(entry.key()),
                         poll_stream_for,
-                        PollOpt::edge(),
                     );
                     if let Err(e) = result {
                         eprintln!("Cannot register unix seqpacket connection: {}", e);
@@ -939,7 +937,7 @@ pub fn udp_receive<F: FnMut(usize, SocketAddr, &mut Server)>
 
 /// returns false if a WouldBlock error was returned, and logs errors
 pub fn udp_send(from: &UdpSocket,  msg: &[u8],  to: &SocketAddr,  service_name: &str) -> bool {
-    match from.send_to(msg, to) {
+    match from.send_to(msg, *to) {
         Err(ref e) if e.kind() == ErrorKind::WouldBlock => return false,
         Err(e) => {
             eprintln!("error sending UDP packet ({}, udp://{}): {}",
@@ -1031,15 +1029,16 @@ pub fn unix_datagram_send(from: &UnixDatagram,  msg: &[u8],  to: &UnixSocketAddr
 ///
 /// capacity and max message size should be set via the options parameter.
 #[cfg(feature="posixmq")]
-pub fn listen_posixmq(server: &mut Server,  service_name: &'static str,  poll_for: Ready,
-        options: &mut posixmq::OpenOptions,
+pub fn listen_posixmq(
+        server: &mut Server,  service_name: &'static str,
+        interest: Interest,  options: &mut posixmq::OpenOptions,
         encapsulate: &mut dyn FnMut(PosixMqWrapper, Token)->ServiceSocket
 ) {
     match options.create().nonblocking().open(service_name) {
-        Ok(mq) => {
+        Ok(mut mq) => {
             let entry = server.sockets.vacant_entry();
             let token = Token(entry.key());
-            let res = server.poll.register(&mq, token, poll_for, mio::PollOpt::edge());
+            let res = server.poll.registry().register(&mut mq, token, interest);
             if let Err(e) = res {
                 eprintln!("Cannot register posix message queue /{} with mio: {}, skipping",
                     service_name, e

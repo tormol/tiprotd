@@ -1,18 +1,16 @@
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Write, IoSlice};
 use std::net::{Shutdown, SocketAddr};
 use std::rc::Rc;
-#[cfg(feature="seqpacket")]
-use std::io::IoSlice;
 
-use mio::{IoVec, Ready, Token};
+use mio::{Interest, Token, event::Event};
 use mio::net::{TcpListener, UdpSocket};
 #[cfg(feature="udplite")]
 use udplite::UdpLiteSocket;
 #[cfg(unix)]
 use uds::{UnixSocketAddr, UnixDatagramExt};
 #[cfg(unix)]
-use mio_uds::{UnixDatagram, UnixListener};
+use mio::net::{UnixDatagram, UnixListener};
 #[cfg(feature="seqpacket")]
 use uds::nonblocking::UnixSeqpacketListener;
 
@@ -69,9 +67,9 @@ pub enum EchoSocket {
 }
 
 fn tcp_echo(conn: &mut TcpStreamWrapper,  unsent: &mut VecDeque<u8>,  recv_shutdown: &mut bool,
-        buffer: &mut[u8],  readiness: Ready
+        buffer: &mut[u8],  event: &Event,
 ) -> EntryStatus {
-    if !*recv_shutdown && readiness.is_readable() {
+    if !*recv_shutdown && event.is_readable() {
         loop {
             match conn.read(buffer) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -111,11 +109,7 @@ fn tcp_echo(conn: &mut TcpStreamWrapper,  unsent: &mut VecDeque<u8>,  recv_shutd
         // use vectored io to send both slices of the deque at once
         // IoVec can't be empty though, so need to special case
         let (first, second) = unsent.as_slices();
-        let result = match IoVec::from_bytes(second) {
-            Some(second) => conn.write_bufs(&[first.into(), second]),
-            None => conn.write(first),
-        };
-        match result {
+        match conn.write_vectored(&[IoSlice::new(first), IoSlice::new(second)]) {
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
             Ok(len @ 1..=std::usize::MAX) => {
                 conn.limit_counters.release_resources(len);
@@ -138,9 +132,9 @@ fn tcp_echo(conn: &mut TcpStreamWrapper,  unsent: &mut VecDeque<u8>,  recv_shutd
 
 #[cfg(unix)]
 fn unix_stream_echo(conn: &mut UnixStreamWrapper,  unsent: &mut VecDeque<u8>,
-        recv_shutdown: &mut bool,  buffer: &mut[u8],  readiness: Ready
+        recv_shutdown: &mut bool,  buffer: &mut[u8],  event: &Event,
 ) -> EntryStatus {
-    if !*recv_shutdown && readiness.is_readable() {
+    if !*recv_shutdown && event.is_readable() {
         loop {
             match conn.read(buffer) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -163,11 +157,7 @@ fn unix_stream_echo(conn: &mut UnixStreamWrapper,  unsent: &mut VecDeque<u8>,
         // use vectored io to send both slices of the deque at once
         // IoVec can't be empty though, so need to special case
         let (first, second) = unsent.as_slices();
-        let result = match IoVec::from_bytes(second) {
-            Some(second) => conn.write_bufs(&[first.into(), second]),
-            None => conn.write(first),
-        };
-        match result {
+        match conn.write_vectored(&[IoSlice::new(first), IoSlice::new(second)]) {
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
             Ok(len @ 1..=std::usize::MAX) => {
                 unsent.drain(..len).for_each(|_| {} );
@@ -191,9 +181,9 @@ fn unix_seqpacket_echo(
         conn: &mut UnixSeqpacketConnWrapper,
         state: &mut EchoSeqpacketConnState,
         buffer: &mut[u8],
-        readiness: Ready
+        event: &Event,
 ) -> EntryStatus {
-    if !state.recv_shutdown && readiness.is_readable() {
+    if !state.recv_shutdown && event.is_readable() {
         loop {
             match conn.recv(buffer) {
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -275,11 +265,11 @@ impl EchoSocket {
         listen_tcp(server, "echo", ECHO_PORT,
             &mut|listener, Token(_)| ServiceSocket::Echo(TcpListener(listener))
         );
-        listen_udp(server, "echo", ECHO_PORT, Ready::readable() | Ready::writable(),
+        listen_udp(server, "echo", ECHO_PORT, Interest::READABLE | Interest::WRITABLE,
             &mut|socket, Token(_)| ServiceSocket::Echo(Udp(socket, VecDeque::new()))
         );
         #[cfg(feature="udplite")]
-        listen_udplite(server, "echo", ECHO_PORT, Ready::readable() | Ready::writable(), None,
+        listen_udplite(server, "echo", ECHO_PORT, Interest::READABLE | Interest::WRITABLE, None,
             &mut|socket, Token(_)| ServiceSocket::Echo(UdpLite(socket, VecDeque::new()))
         );
         #[cfg(unix)]
@@ -291,15 +281,18 @@ impl EchoSocket {
             &mut|listener, Token(_)| ServiceSocket::Echo(UnixSeqpacketListener(listener))
         );
         #[cfg(unix)]
-        UnixSocketWrapper::create_datagram_socket("echo", Ready::all(), server,
+        UnixSocketWrapper::create_datagram_socket(
+            "echo",
+            Interest::READABLE | Interest::WRITABLE,
+            server,
             &mut|socket, Token(_)| ServiceSocket::Echo(UnixDatagram(socket, VecDeque::new()))
         );
     }
 
-    pub fn ready(&mut self,  readiness: Ready,  _: Token,  server: &mut Server) -> EntryStatus {
+    pub fn ready(&mut self,  event: &Event,  server: &mut Server) -> EntryStatus {
         match self {
             &mut TcpListener(ref listener) => {
-                tcp_accept_loop(listener, server, &"echo", Ready::all(),
+                tcp_accept_loop(listener, server, &"echo", Interest::READABLE | Interest::WRITABLE,
                     |_| Some(()),
                     |stream, (), Token(_)| {
                         ServiceSocket::Echo(TcpConn(stream, VecDeque::new(), false))
@@ -307,14 +300,14 @@ impl EchoSocket {
                 )
             }
             &mut TcpConn(ref mut stream, ref mut unsent, ref mut read_shutdown) => {
-                tcp_echo(stream, unsent, read_shutdown, &mut server.buffer, readiness)
+                tcp_echo(stream, unsent, read_shutdown, &mut server.buffer, event)
             }
             // don't count stored UDP data toward resource limits, as sending
             // is only limited by the OS's socket buffer, and not by the
             // client or network. A client should not be able to cause an
             // issue here before hitting its UDP send limit.
             &mut Udp(ref socket, ref mut unsent) => {
-                if readiness.is_readable() {
+                if event.is_readable() {
                     let result = udp_receive(socket, server, "echo", |len, from, server| {
                         if server.limits.get_unacknowledged_send_state(from)
                         == ClientState::Unlimited {
@@ -354,7 +347,7 @@ impl EchoSocket {
             }
             #[cfg(feature="udplite")]
             &mut UdpLite(ref socket, ref mut unsent) => {
-                if readiness.is_readable() {
+                if event.is_readable() {
                     let result = udplite_receive(socket, server, "echo", |len, from, server| {
                         if server.limits.get_unacknowledged_send_state(from)
                         == ClientState::Unlimited {
@@ -404,7 +397,7 @@ impl EchoSocket {
             }
             #[cfg(unix)]
             &mut UnixDatagram(ref socket, ref mut unsent) => {
-                if readiness.is_readable() {
+                if event.is_readable() {
                     loop {
                         match socket.recv_from_unix_addr(&mut server.buffer) {
                             Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -436,7 +429,11 @@ impl EchoSocket {
             }
             #[cfg(unix)]
             &mut UnixStreamListener(ref listener) => {
-                unix_stream_accept_loop(listener, server, &"echo", Ready::all(),
+                unix_stream_accept_loop(
+                    listener,
+                    server,
+                    &"echo",
+                    Interest::READABLE | Interest::WRITABLE,
                     |_| Some(()),
                     |stream, (), Token(_)| {
                         ServiceSocket::Echo(UnixStreamConn(stream, VecDeque::new(), false))
@@ -445,11 +442,15 @@ impl EchoSocket {
             }
             #[cfg(unix)]
             &mut UnixStreamConn(ref mut conn, ref mut unsent, ref mut read_shutdown) => {
-                unix_stream_echo(conn, unsent, read_shutdown, &mut server.buffer, readiness)
+                unix_stream_echo(conn, unsent, read_shutdown, &mut server.buffer, event)
             }
             #[cfg(feature="seqpacket")]
             &mut UnixSeqpacketListener(ref listener) => {
-                unix_seqpacket_accept_loop(listener, server, &"echo", Ready::all(),
+                unix_seqpacket_accept_loop(
+                    listener,
+                    server,
+                    &"echo",
+                    Interest::READABLE | Interest::WRITABLE,
                     |_| Some(()),
                     |conn, (), Token(_)| {
                         let clean_state = EchoSeqpacketConnState::default();
@@ -459,7 +460,7 @@ impl EchoSocket {
             }
             #[cfg(feature="seqpacket")]
             &mut UnixSeqpacketConn(ref mut conn, ref mut state) => {
-                unix_seqpacket_echo(conn, state, &mut server.buffer, readiness)
+                unix_seqpacket_echo(conn, state, &mut server.buffer, event)
             }
         }
     }
