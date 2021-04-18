@@ -5,21 +5,29 @@ It is written in Rust, using the low-level async library `mio`.
 
 ## Implemented protocols
 
-* echo (TCP and UDP port 7, unix stream and datagram socket)
-* discard (TCP and UDP port 9, unix stream and datagram socket, posix message queue)
-* QOTD (TCP and UDP port 17, unix stream and datagram socket)
-* time (TCP and UDP port 37, unix stream and datagram socket)
+* echo (TCP, UDP and UDPlite port 7, unix stream, seqpacket and datagram socket)
+* discard (TCP, SCTP, UDP and UDPlite port 9, unix stream, seqpacket and datagram socket, posix message queue, pipe)
+* daytime (TCP, UDP and UDPlite port 13, unix stream, seqpacket and datagram socket)
+* QOTD (TCP, UDP and UDPlite port 17, unix stream, seqpacket and datagram socket)
+* chargen (TCP, UDP and UDPlite port 17, unix stream, seqpacket and datagram socket)
+* time (TCP, UDP and UDPlite port 37, unix stream, seqpacket and datagram socket)
 
 To prevent being used for UDP amplification DDoS attacks, UDP replies are
-limited to 1 MiB per IPv4 address or IPv6 /64 network within a 10 minute window.
+limited to 1 MiB per IPv4 address or IPv6 /64 network within a 10 minute window
+unless a TCP connection has been made from that IP.
+Some protocols also send less data or don't respond to unverified clients.
 
-I plan to also implement at least daytime (port 13) and TCPMUX (port 1),
-and want to also support the transport layer protocols SCTP, DCCP, UDPlite,
-and unix SOCK_SEQPACKET.
+The unix domain protocols listen to abstract addresses
+in addition to path-based addresses in the current directory.
+
+I plan to eventually also implement TCPMUX (port 1), TFTP (port 69) and Modbus TCP (port 502)
+and want to also support the transport layer protocols DCCP and SCTP fully.
 
 ## Invocation
 
-It currently doesn't support any configuration and ignore command line arguments.
+Command line arguments are ignored and there is no way to select which protocols to enable or where they listen.
+Quotes to send from QOTD are read from quotes.txt in the current directory. Quotes are separated by lines starting with three or more dashes.
+The content used for chargen is read from LICENSE.md.
 
 If binding to the first port fails due to permission error, it will add 10000 to
 the port numbers and try again. (so echo becomes port 10007 and time becomes port
