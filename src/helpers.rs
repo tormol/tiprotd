@@ -24,7 +24,7 @@ use uds::nonblocking::{UnixSeqpacketListener, UnixSeqpacketConn};
 #[cfg(unix)]
 use nix::sys::socket::{getsockopt, setsockopt, sockopt::*};
 #[cfg(unix)]
-use nix::sys::socket::{InetAddr, SockAddr};
+use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 #[cfg(unix)]
 use nix::libc;
 
@@ -133,19 +133,6 @@ pub enum EntryStatus { Drained, Unfinished, Remove }
 pub use EntryStatus::*;
 
 
-/// Convert a nix result to a std::io result.
-///
-/// It maps nix::Error::Sys to std::io::Error::last_os_error() (because nix's
-/// Errno is lossy) and panics on any nix invented error.
-#[cfg(unix)]
-fn nixe<T>(nix_result: Result<T, nix::Error>) -> Result<T, io::Error> {
-    match nix_result {
-        Ok(success) => Ok(success),
-        Err(nix::Error::Sys(_)) => Err(io::Error::last_os_error()),
-        Err(nix_invented) => panic!("nix caused error: {}", nix_invented)
-    }
-}
-
 #[cfg(unix)]
 fn create_incoming_socket(protocol: Protocol,
         typ: c_int,  variant: c_int,
@@ -163,8 +150,9 @@ fn create_incoming_socket(protocol: Protocol,
     if socket == -1 {
         return Err(io::Error::last_os_error());
     }
-    if let Err(e) = nixe(setsockopt(socket, ReuseAddr, &true)) {
-        eprintln!("Connot set SO_REUSEADDR for {} socket: {}", protocol.description(), e);
+    if let Err(_) = setsockopt(socket, ReuseAddr, &true) {
+        let lossless_err = io::Error::last_os_error(); // Nix's enum won't have future error codes.
+        eprintln!("Connot set SO_REUSEADDR for {} socket: {}", protocol.description(), lossless_err);
     }
     if log_buffers {
         if let Ok(default_size) = getsockopt(socket, RcvBuf) {
@@ -238,10 +226,9 @@ pub fn listen_tcp(server: &mut Server,  service_name: &'static str,  port: u16,
     #[cfg(unix)]
     let res = server.try_bind_ip("tcp", service_name, port, Interest::READABLE,
         |addr| {
-            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
-            let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
+            let nix_addr = SockaddrStorage::from(addr);
             let listener = create_incoming_socket(Protocol::Tcp,
-                libc::SOCK_STREAM, 0, sockaddr, socklen,
+                libc::SOCK_STREAM, 0, unsafe { &*nix_addr.as_ptr() }, nix_addr.len(),
                 Some(0), false, Some(10)/*FIXME find what std uses*/
             )?;
             unsafe { Ok(TcpListener::from_raw_fd(listener)) }
@@ -462,10 +449,9 @@ pub fn listen_dccp(server: &mut Server,  service_name: &'static str,  port: u16,
     }
     let res = server.try_bind_ip("dccp", service_name, port, Interest::READABLE,
         |addr| {
-            let nix_addr = SockAddr::Inet(InetAddr::from_std(&addr));
-            let (sockaddr, socklen) = unsafe { nix_addr.as_ffi_pair() };
+            let nix_addr = SockaddrStorage::from(addr);
             let listener = create_incoming_socket(Protocol::Dccp,
-                    libc::SOCK_DCCP, 0, sockaddr, socklen,
+                    libc::SOCK_DCCP, 0, unsafe { &*nix_addr.as_ptr() }, nix_addr.len(),
                     Some(0), false, Some(10/*FIXME*/),
             )?;
             unsafe { Ok(TcpListener::from_raw_fd(listener)) }

@@ -17,7 +17,7 @@ rand = "0.7"
 
 [target.'cfg(unix)'.dependencies] # maybe not neccessary, but I'm not testing on Windows
 uds = {version="0.2.3", features=["mio_07"]}
-nix = "0.14.1"
+nix = "0.24.1"
 libc = "0.2.71"
 
 [features]
